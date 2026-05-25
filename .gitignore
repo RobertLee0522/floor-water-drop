@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Ignore all image / photo files as requested
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.ico
+
+# Ignore directories with photos
+地板/JHEM600GC-HM-P+457108611063/
+地板/水滴/
