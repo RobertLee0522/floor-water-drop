@@ -18,6 +18,12 @@ Thumbs.db
 *.webp
 *.ico
 
-# Ignore directories with photos
+# Ignore directories with photos and results
 地板/JHEM600GC-HM-P+457108611063/
 地板/水滴/
+結果/
+
+# Ignore videos and video exports
+*.mp4
+*.avi
+*.mkv
