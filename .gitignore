@@ -1,29 +1,59 @@
-# Python cache
+# ── Python ──
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
 
-# IDEs and OS files
+# ── IDE / OS ──
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# Ignore all image / photo files as requested
+# ── 圖片（不追蹤，檔案量龐大）──
 *.jpg
 *.jpeg
 *.png
 *.gif
 *.bmp
+*.tif
 *.tiff
 *.webp
 *.ico
+*.raw
+*.heic
 
-# Ignore directories with photos and results
-地板/JHEM600GC-HM-P+457108611063/
-地板/水滴/
-結果/
-
-# Ignore videos and video exports
+# ── 影片 ──
 *.mp4
 *.avi
 *.mkv
+*.mov
+*.wmv
+
+# ── YOLO 模型權重（動輒數百 MB）──
+*.pt
+*.onnx
+*.engine
+*.trt
+*.torchscript
+
+# ── YOLO / Ultralytics 訓練產出 ──
+runs/
+
+# ── 資料集 / 標注 ──
+datasets/
+data/
+*.yaml.bak
+
+# ── 匯出結果 ──
+*.csv
+結果/
+output/
+exports/
+
+# ── 影像資料資料夾（含大量照片）──
+地板/JHEM600GC-HM-P+457108611063/
+地板/水滴/
+地板/0601/
