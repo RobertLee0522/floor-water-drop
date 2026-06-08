@@ -55,6 +55,22 @@ ROI_COLORS_BGR = [
     (0, 255, 255),
 ]
 
+# 水滴圓圈顏色選項（名稱 → BGR）
+BLOB_COLORS = {
+    '青色':  (0, 200, 255),
+    '紅色':  (0, 0, 255),
+    '綠色':  (0, 255, 0),
+    '黃色':  (0, 255, 255),
+    '橙色':  (0, 165, 255),
+    '白色':  (255, 255, 255),
+    '粉紅':  (180, 105, 255),
+    '紫色':  (255, 0, 200),
+}
+
+# TopHat 熱圖色彩地圖選項
+TOPHAT_CMAPS = ['inferno', 'hot', 'jet', 'viridis', 'plasma',
+                'magma', 'coolwarm', 'rainbow', 'bone', 'gray']
+
 C_BG    = '#0f172a'
 C_PANEL = '#1e293b'
 C_CARD  = '#0d1117'
@@ -97,9 +113,10 @@ def auto_roi_rect(gray: np.ndarray):
     return (0, y1, w, y2)
 
 
-def detect_method_b(roi_gray: np.ndarray, sigma: float = TOPHAT_SIGMA):
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                  (TOPHAT_KERNEL_SIZE, TOPHAT_KERNEL_SIZE))
+def detect_method_b(roi_gray: np.ndarray, sigma: float = TOPHAT_SIGMA,
+                    kernel_size: int = TOPHAT_KERNEL_SIZE):
+    ksize = max(3, int(kernel_size) | 1)   # 強制奇數，至少 3
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
     tophat = cv2.morphologyEx(roi_gray, cv2.MORPH_TOPHAT, k)
     th = max(float(tophat.mean() + sigma * tophat.std()), 8.0)
     _, binary = cv2.threshold(tophat, int(th), 255, cv2.THRESH_BINARY)
@@ -108,21 +125,29 @@ def detect_method_b(roi_gray: np.ndarray, sigma: float = TOPHAT_SIGMA):
     return binary, tophat
 
 
-def detect_method_a(roi_gray: np.ndarray, thresh: int):
-    blurred = cv2.GaussianBlur(roi_gray, (5, 5), 0)
-    _, binary = cv2.threshold(blurred, thresh, 255, cv2.THRESH_BINARY)
+def detect_method_a(roi_gray: np.ndarray, thresh: int,
+                    use_blur: bool = True, use_open: bool = True,
+                    use_close: bool = True):
+    # 高斯模糊：去雜訊但會抹平小亮點 → 想抓細白點時可關閉
+    src = cv2.GaussianBlur(roi_gray, (5, 5), 0) if use_blur else roi_gray
+    _, binary = cv2.threshold(src, thresh, 255, cv2.THRESH_BINARY)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k, iterations=1)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=1)
+    # 開運算：清掉孤立小點（噪點），但也會清掉細小水滴 → 想抓細白點時可關閉
+    if use_open:
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k, iterations=1)
+    # 閉運算：填補水滴內的小洞
+    if use_close:
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=1)
     return binary
 
 
-def find_blobs(binary: np.ndarray):
+def find_blobs(binary: np.ndarray, min_area: int = MIN_BLOB_AREA,
+               max_area: int = MAX_BLOB_AREA):
     n, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
     blobs = []
     for i in range(1, n):
         area = stats[i, cv2.CC_STAT_AREA]
-        if MIN_BLOB_AREA <= area <= MAX_BLOB_AREA:
+        if min_area <= area <= max_area:
             blobs.append({'cx': centroids[i][0], 'cy': centroids[i][1], 'area': area})
     return blobs
 
@@ -144,7 +169,8 @@ def clamp_rect(x1, y1, x2, y2, W, H):
     return x1, y1, x2, y2
 
 
-def draw_overlay(frame, rois, all_blobs, is_wet, paused, draw_mode):
+def draw_overlay(frame, rois, all_blobs, is_wet, paused, draw_mode,
+                 blob_color=(0, 200, 255), blob_thickness=2):
     vis = frame.copy()
     h, w = vis.shape[:2]
 
@@ -161,8 +187,8 @@ def draw_overlay(frame, rois, all_blobs, is_wet, paused, draw_mode):
             cx = int(b['cx']) + x1
             cy = int(b['cy']) + y1
             r  = max(3, int(np.sqrt(b['area'] / np.pi)))
-            cv2.circle(vis, (cx, cy), r, (0, 200, 255), 1)
-            cv2.circle(vis, (cx, cy), 2, (0, 200, 255), -1)
+            cv2.circle(vis, (cx, cy), r, blob_color, blob_thickness)
+            cv2.circle(vis, (cx, cy), max(2, blob_thickness), blob_color, -1)
 
     status_text = "WET" if is_wet else "DRY"
     sc = (0, 60, 255) if is_wet else (60, 220, 60)
@@ -233,6 +259,25 @@ class WaterDropApp:
         self._frame_data      = {}   # {frame_idx: {name,drops,is_wet,chi2}}
         self._export_cancel   = False
 
+        # 色彩設定
+        self._tophat_cmap     = 'inferno'
+        self._blob_color_bgr  = (0, 200, 255)   # 水滴圓圈 BGR 顏色
+        self._blob_thickness  = 2               # 水滴圓圈線條粗細
+        self._min_area        = MIN_BLOB_AREA   # 偵測最小面積（越小越敏感）
+
+        # Threshold（方法 A）前後處理開關
+        self._use_blur        = True            # 高斯模糊
+        self._use_open        = True            # 開運算去噪
+        self._use_close       = True            # 閉運算補洞
+
+        # TopHat（方法 B）可調參數
+        self._tophat_sigma    = TOPHAT_SIGMA        # 靈敏度（越小越敏感）
+        self._tophat_kernel   = TOPHAT_KERNEL_SIZE  # 結構元素大小
+
+        # 左鍵拖曳平移（非框選模式時）
+        self._lpan_start      = None
+        self._lpan_origin     = None
+
         # 框選拖曳
         self._drag_start      = None
         self._drag_rect_id    = None
@@ -262,7 +307,22 @@ class WaterDropApp:
     # UI 建構
     # ──────────────────────────────────────────
 
+    def _setup_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use('default')
+        except Exception:
+            pass
+        style.configure('Dark.TNotebook', background=C_PANEL, borderwidth=0)
+        style.configure('Dark.TNotebook.Tab', background=C_CARD, foreground=C_MUTED,
+                        padding=(14, 4), font=('微軟正黑體', 9))
+        style.map('Dark.TNotebook.Tab',
+                  background=[('selected', C_ACCENT)],
+                  foreground=[('selected', 'white')])
+
     def _build_ui(self):
+        self._setup_styles()
+
         title_bar = tk.Frame(self.root, bg=C_BG)
         title_bar.pack(fill='x', padx=12, pady=(8, 0))
         tk.Label(title_bar, text='水滴辨識系統',
@@ -441,32 +501,132 @@ class WaterDropApp:
         tk.Label(zoom_row, textvariable=self._zoom_var,
                  bg=C_PANEL, fg=C_ACCENT,
                  font=('Consolas', 9, 'bold')).pack(side='right')
-        tk.Label(parent, text='滾輪縮放｜右鍵拖曳平移｜雙擊重設',
+        tk.Label(parent, text='滾輪縮放｜左/右鍵拖曳平移｜雙擊重設',
                  bg=C_PANEL, fg=C_MUTED,
                  font=('微軟正黑體', 7)).pack(anchor='w', padx=10)
 
-        # 偵測方法
+        # 偵測方法（分頁切換各自參數）
         section_label(parent, '偵測方法')
-        self._method_var = tk.StringVar(value='B')
-        for val, text in [('B', 'TopHat（推薦）'), ('A', 'Threshold')]:
-            tk.Radiobutton(
-                parent, text=text, variable=self._method_var, value=val,
-                command=self._on_method_change,
-                bg=C_PANEL, fg=C_TEXT, selectcolor='#334155',
-                activebackground=C_PANEL,
-                font=('微軟正黑體', 9)
-            ).pack(anchor='w', padx=12)
 
-        thresh_row = tk.Frame(parent, bg=C_PANEL)
-        thresh_row.pack(fill='x', padx=10, pady=1)
+        nb = ttk.Notebook(parent, style='Dark.TNotebook')
+        nb.pack(fill='x', padx=10, pady=(2, 2))
+        self._method_nb = nb
+
+        # ── 分頁 1：TopHat ──
+        tab_b = tk.Frame(nb, bg=C_PANEL)
+        nb.add(tab_b, text='TopHat')
+
+        sig_row = tk.Frame(tab_b, bg=C_PANEL)
+        sig_row.pack(fill='x', padx=4, pady=(6, 1))
+        tk.Label(sig_row, text='靈敏度', bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 8), width=6, anchor='w').pack(side='left')
+        self._sigma_var = tk.DoubleVar(value=self._tophat_sigma)
+        tk.Scale(sig_row, from_=0.2, to=4.0, resolution=0.1, orient='horizontal',
+                 variable=self._sigma_var, command=self._on_tophat_change,
+                 bg=C_PANEL, fg=C_TEXT, troughcolor='#374151',
+                 highlightthickness=0, showvalue=True, length=135
+                 ).pack(side='right')
+
+        ker_row = tk.Frame(tab_b, bg=C_PANEL)
+        ker_row.pack(fill='x', padx=4, pady=1)
+        tk.Label(ker_row, text='核大小', bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 8), width=6, anchor='w').pack(side='left')
+        self._kernel_var = tk.IntVar(value=self._tophat_kernel)
+        tk.Scale(ker_row, from_=5, to=121, resolution=2, orient='horizontal',
+                 variable=self._kernel_var, command=self._on_tophat_change,
+                 bg=C_PANEL, fg=C_TEXT, troughcolor='#374151',
+                 highlightthickness=0, showvalue=True, length=135
+                 ).pack(side='right')
+        tk.Label(tab_b, text='靈敏度↓更敏感｜核需略大於水滴',
+                 bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 7)).pack(anchor='w', padx=4, pady=(1, 4))
+
+        # ── 分頁 2：二值化 (Threshold) ──
+        tab_a = tk.Frame(nb, bg=C_PANEL)
+        nb.add(tab_a, text='二值化')
+
+        thresh_row = tk.Frame(tab_a, bg=C_PANEL)
+        thresh_row.pack(fill='x', padx=4, pady=(6, 1))
         tk.Label(thresh_row, text='閾值', bg=C_PANEL, fg=C_MUTED,
-                 font=('微軟正黑體', 8), width=4, anchor='w').pack(side='left')
+                 font=('微軟正黑體', 8), width=6, anchor='w').pack(side='left')
         self._thresh_var = tk.IntVar(value=self.thresh)
         tk.Scale(thresh_row, from_=10, to=250, orient='horizontal',
                  variable=self._thresh_var,
-                 command=lambda v: setattr(self, 'thresh', int(float(v))),
+                 command=lambda v: self._on_thresh_change(v),
                  bg=C_PANEL, fg=C_TEXT, troughcolor='#374151',
-                 highlightthickness=0, showvalue=True, length=155
+                 highlightthickness=0, showvalue=True, length=135
+                 ).pack(side='right')
+
+        proc_row = tk.Frame(tab_a, bg=C_PANEL)
+        proc_row.pack(fill='x', padx=4, pady=(3, 0))
+        self._blur_var  = tk.BooleanVar(value=self._use_blur)
+        self._open_var  = tk.BooleanVar(value=self._use_open)
+        self._close_var = tk.BooleanVar(value=self._use_close)
+        for txt, var in [('模糊', self._blur_var),
+                         ('去噪', self._open_var),
+                         ('補洞', self._close_var)]:
+            tk.Checkbutton(proc_row, text=txt, variable=var,
+                           command=self._on_proc_change,
+                           bg=C_PANEL, fg=C_TEXT, selectcolor='#334155',
+                           activebackground=C_PANEL, activeforeground=C_TEXT,
+                           font=('微軟正黑體', 8)).pack(side='left', padx=(0, 4))
+        tk.Label(tab_a, text='抓細白點：建議關閉「模糊」與「去噪」',
+                 bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 7)).pack(anchor='w', padx=4, pady=(1, 4))
+
+        # 預設選 TopHat 分頁；切換分頁即切換方法
+        nb.select(0 if self.method == 'B' else 1)
+        nb.bind('<<NotebookTabChanged>>', self._on_tab_change)
+
+        # 共用參數：最小面積
+        area_row = tk.Frame(parent, bg=C_PANEL)
+        area_row.pack(fill='x', padx=10, pady=(2, 1))
+        tk.Label(area_row, text='最小面積', bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 8), width=6, anchor='w').pack(side='left')
+        self._area_var = tk.IntVar(value=self._min_area)
+        tk.Scale(area_row, from_=1, to=50, orient='horizontal',
+                 variable=self._area_var,
+                 command=self._on_area_change,
+                 bg=C_PANEL, fg=C_TEXT, troughcolor='#374151',
+                 highlightthickness=0, showvalue=True, length=140
+                 ).pack(side='right')
+        tk.Label(parent, text='數值越小越能捕捉細小白點',
+                 bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 7)).pack(anchor='w', padx=10)
+
+        # 色彩設定
+        section_label(parent, '色彩設定')
+
+        cmap_row = tk.Frame(parent, bg=C_PANEL)
+        cmap_row.pack(fill='x', padx=10, pady=2)
+        tk.Label(cmap_row, text='熱圖', bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 8), width=5, anchor='w').pack(side='left')
+        self._cmap_var = tk.StringVar(value='inferno')
+        cmap_cb = ttk.Combobox(cmap_row, textvariable=self._cmap_var,
+                               values=TOPHAT_CMAPS, width=11, state='readonly')
+        cmap_cb.pack(side='right')
+        cmap_cb.bind('<<ComboboxSelected>>', self._on_cmap_change)
+
+        blob_row = tk.Frame(parent, bg=C_PANEL)
+        blob_row.pack(fill='x', padx=10, pady=2)
+        tk.Label(blob_row, text='水滴圈', bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 8), width=5, anchor='w').pack(side='left')
+        self._blob_color_var = tk.StringVar(value='青色')
+        blob_cb = ttk.Combobox(blob_row, textvariable=self._blob_color_var,
+                               values=list(BLOB_COLORS.keys()), width=11, state='readonly')
+        blob_cb.pack(side='right')
+        blob_cb.bind('<<ComboboxSelected>>', self._on_blob_color_change)
+
+        thick_row = tk.Frame(parent, bg=C_PANEL)
+        thick_row.pack(fill='x', padx=10, pady=1)
+        tk.Label(thick_row, text='線粗', bg=C_PANEL, fg=C_MUTED,
+                 font=('微軟正黑體', 8), width=5, anchor='w').pack(side='left')
+        self._thick_var = tk.IntVar(value=self._blob_thickness)
+        tk.Scale(thick_row, from_=1, to=6, orient='horizontal',
+                 variable=self._thick_var,
+                 command=self._on_thickness_change,
+                 bg=C_PANEL, fg=C_TEXT, troughcolor='#374151',
+                 highlightthickness=0, showvalue=True, length=150
                  ).pack(side='right')
 
         # 鍵盤快捷鍵
@@ -502,11 +662,42 @@ class WaterDropApp:
                  bg='#0ea5e9', padx=8).pack(side='left', padx=(0, 4))
         flat_btn(exp_row, '🎬 影片', self._export_video,
                  bg='#7c3aed', padx=8).pack(side='left')
-        tk.Label(parent, text='影片以目前 ROI 設定輸出',
+
+        img_row = tk.Frame(parent, bg=C_PANEL)
+        img_row.pack(fill='x', padx=10, pady=(0, 2))
+        flat_btn(img_row, '🖼 儲存目前幀', self._save_current_frame,
+                 bg='#059669', padx=6).pack(side='left', padx=(0, 4))
+        flat_btn(img_row, '📁 批次儲存', self._batch_save_frames,
+                 bg='#0d9488', padx=6).pack(side='left')
+        tk.Label(parent, text='影片/批次以目前 ROI 及色彩設定輸出',
                  bg=C_PANEL, fg=C_MUTED,
                  font=('微軟正黑體', 7)).pack(anchor='w', padx=10)
 
     def _build_charts(self, parent):
+        nb = ttk.Notebook(parent, style='Dark.TNotebook')
+        nb.pack(fill='both', expand=True)
+        self._bottom_nb = nb
+
+        # ── 分頁：左右對比 ──
+        cmp_tab = tk.Frame(nb, bg=C_CARD)
+        nb.add(cmp_tab, text='左右對比')
+        self._cmp_fig = Figure(figsize=(13, 2.6), facecolor=C_CARD, dpi=80)
+        self._cmp_fig.subplots_adjust(left=0.01, right=0.99, top=0.90,
+                                      bottom=0.02, wspace=0.04)
+        self._ax_orig   = self._cmp_fig.add_subplot(121)
+        self._ax_result = self._cmp_fig.add_subplot(122)
+        for ax, t in [(self._ax_orig, '原圖'), (self._ax_result, '偵測結果')]:
+            ax.set_facecolor('#060d14')
+            ax.set_title(t, color=C_TEXT, fontsize=8, pad=3)
+            ax.axis('off')
+        cfc = FigureCanvasTkAgg(self._cmp_fig, master=cmp_tab)
+        cfc.draw()
+        cfc.get_tk_widget().pack(fill='both', expand=True)
+        self._cmp_canvas = cfc
+
+        # ── 分頁：分析圖表 ──
+        chart_tab = tk.Frame(nb, bg=C_CARD)
+        nb.add(chart_tab, text='分析圖表')
         self._fig = Figure(figsize=(13, 2.6), facecolor=C_CARD, dpi=80)
         self._fig.subplots_adjust(left=0.04, right=0.99, top=0.87,
                                    bottom=0.12, wspace=0.38)
@@ -531,7 +722,7 @@ class WaterDropApp:
         self._lc, = self._ax_change.plot([], [], color='#f87171', lw=1.2)
         self._ln, = self._ax_count.plot([],  [], color='#34d399', lw=1.2)
 
-        fc = FigureCanvasTkAgg(self._fig, master=parent)
+        fc = FigureCanvasTkAgg(self._fig, master=chart_tab)
         fc.draw()
         fc.get_tk_widget().pack(fill='both', expand=True)
         self._fig_canvas = fc
@@ -541,7 +732,22 @@ class WaterDropApp:
         for ax in (self._ax_roi, self._ax_tophat, self._ax_binary):
             ax.imshow(blank, cmap='gray', aspect='auto')
             ax.axis('off')
+        for ax in (self._ax_orig, self._ax_result):
+            ax.imshow(blank, cmap='gray', aspect='auto')
+            ax.axis('off')
         self._fig_canvas.draw_idle()
+        self._cmp_canvas.draw_idle()
+
+    def _update_comparison(self, orig_rgb, result_rgb):
+        self._ax_orig.cla()
+        self._ax_orig.imshow(orig_rgb, aspect='auto')
+        self._ax_orig.set_title('原圖', color=C_TEXT, fontsize=8, pad=3)
+        self._ax_orig.axis('off')
+        self._ax_result.cla()
+        self._ax_result.imshow(result_rgb, aspect='auto')
+        self._ax_result.set_title('偵測結果', color=C_TEXT, fontsize=8, pad=3)
+        self._ax_result.axis('off')
+        self._cmp_canvas.draw_idle()
 
     # ──────────────────────────────────────────
     # 縮放 / 平移
@@ -632,6 +838,11 @@ class WaterDropApp:
 
     def _on_press(self, event):
         if self.draw_mode is None:
+            # 非框選模式 → 左鍵拖曳平移照片
+            if self.images:
+                self._lpan_start  = (event.x, event.y)
+                self._lpan_origin = list(self._pan)
+                self.canvas.config(cursor='fleur')
             return
         self._drag_start = (event.x, event.y)
         if self._drag_rect_id:
@@ -639,7 +850,15 @@ class WaterDropApp:
             self._drag_rect_id = None
 
     def _on_drag(self, event):
-        if self.draw_mode is None or self._drag_start is None:
+        if self.draw_mode is None:
+            # 左鍵平移
+            if self._lpan_start is not None and self.images:
+                dx = event.x - self._lpan_start[0]
+                dy = event.y - self._lpan_start[1]
+                self._pan = [self._lpan_origin[0] + dx, self._lpan_origin[1] + dy]
+                self._render_current()
+            return
+        if self._drag_start is None:
             return
         x0, y0 = self._drag_start
         if self._drag_rect_id:
@@ -661,7 +880,13 @@ class WaterDropApp:
         )
 
     def _on_release(self, event):
-        if self.draw_mode is None or self._drag_start is None:
+        if self.draw_mode is None:
+            # 結束左鍵平移
+            if self._lpan_start is not None:
+                self._lpan_start = None
+                self.canvas.config(cursor='crosshair')
+            return
+        if self._drag_start is None:
             return
         x0, y0 = self._drag_start
         self._drag_start = None
@@ -804,16 +1029,58 @@ class WaterDropApp:
         if self.images:
             self._render_current()
 
-    def _on_method_change(self):
-        self.method = self._method_var.get()
+    def _on_tab_change(self, event=None):
+        # 分頁 0 = TopHat(B)，分頁 1 = 二值化(A)
+        try:
+            idx = self._method_nb.index('current')
+        except Exception:
+            return
+        self.method = 'B' if idx == 0 else 'A'
+        if self.images:
+            self._render_current()
+
+    def _on_tophat_change(self, v=None):
+        self._tophat_sigma  = float(self._sigma_var.get())
+        self._tophat_kernel = int(self._kernel_var.get())
+        if self.images:
+            self._render_current()
+
+    def _on_thresh_change(self, v):
+        self.thresh = int(float(v))
+        if self.images:
+            self._render_current()
+
+    def _on_cmap_change(self, event=None):
+        self._tophat_cmap = self._cmap_var.get()
+        if self.images:
+            self._render_current()
+
+    def _on_blob_color_change(self, event=None):
+        self._blob_color_bgr = BLOB_COLORS[self._blob_color_var.get()]
+        if self.images:
+            self._render_current()
+
+    def _on_thickness_change(self, v):
+        self._blob_thickness = int(float(v))
+        if self.images:
+            self._render_current()
+
+    def _on_area_change(self, v):
+        self._min_area = int(float(v))
+        if self.images:
+            self._render_current()
+
+    def _on_proc_change(self):
+        self._use_blur  = self._blur_var.get()
+        self._use_open  = self._open_var.get()
+        self._use_close = self._close_var.get()
         if self.images:
             self._render_current()
 
     def _toggle_method(self):
-        self.method = 'A' if self.method == 'B' else 'B'
-        self._method_var.set(self.method)
-        if self.images:
-            self._render_current()
+        # 切換分頁；_on_tab_change 會更新 self.method 並重繪
+        cur = self._method_nb.index('current')
+        self._method_nb.select(1 - cur)
 
     def _adj_fps(self, delta):
         self.fps = max(1, min(30, self.fps + delta))
@@ -915,6 +1182,11 @@ class WaterDropApp:
             vw = cv2.VideoWriter(out_path, fourcc, out_fps, (w, h))
             prev_hist_v = None
             total = len(self.images)
+            blob_color = self._blob_color_bgr   # 擷取目前色彩，背景執行緒安全
+            thickness  = self._blob_thickness
+            min_area   = self._min_area
+            ub, uo, uc = self._use_blur, self._use_open, self._use_close
+            sig, ker   = self._tophat_sigma, self._tophat_kernel
 
             for i, img_path in enumerate(self.images):
                 if self._export_cancel:
@@ -935,10 +1207,10 @@ class WaterDropApp:
                         all_blobs.append([])
                         continue
                     if self.method == 'B':
-                        binary, _ = detect_method_b(roi_g)
+                        binary, _ = detect_method_b(roi_g, sig, ker)
                     else:
-                        binary = detect_method_a(roi_g, self.thresh)
-                    all_blobs.append(find_blobs(binary))
+                        binary = detect_method_a(roi_g, self.thresh, ub, uo, uc)
+                    all_blobs.append(find_blobs(binary, min_area))
 
                 cnt = sum(len(b) for b in all_blobs)
 
@@ -949,7 +1221,8 @@ class WaterDropApp:
                 prev_hist_v = cur_h.copy()
                 wet = (d_val > HIST_CHANGE_THRESH) or (cnt > 30)
 
-                vis = draw_overlay(img, rois, all_blobs, wet, False, None)
+                vis = draw_overlay(img, rois, all_blobs, wet, False, None,
+                                   blob_color=blob_color, blob_thickness=thickness)
 
                 # 幀編號文字
                 label = f"#{i+1}/{total}  drops={cnt}"
@@ -977,6 +1250,160 @@ class WaterDropApp:
                 else:
                     messagebox.showinfo('完成', f'影片已儲存：\n{out_path}')
 
+            self.root.after(0, done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _save_current_frame(self):
+        if not self.images:
+            messagebox.showwarning('無資料', '請先載入圖片。')
+            return
+        path = self.images[self.frame_idx]
+        img  = read_image_unicode(path)
+        if img is None:
+            return
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        rois = self.manual_rois if self.manual_rois else [auto_roi_rect(gray)]
+        all_blobs = []
+        for rect in rois:
+            x1, y1, x2, y2 = rect
+            roi_g = gray[y1:y2, x1:x2]
+            if roi_g.size == 0:
+                all_blobs.append([])
+                continue
+            if self.method == 'B':
+                binary, _ = detect_method_b(roi_g, self._tophat_sigma, self._tophat_kernel)
+            else:
+                binary = detect_method_a(roi_g, self.thresh,
+                                         self._use_blur, self._use_open, self._use_close)
+            all_blobs.append(find_blobs(binary, self._min_area))
+
+        d       = self._frame_data.get(self.frame_idx, {}).get('chi2', 0.0)
+        cnt     = sum(len(b) for b in all_blobs)
+        is_wet  = (d > HIST_CHANGE_THRESH) or (cnt > 30)
+        vis     = draw_overlay(img, rois, all_blobs, is_wet, False, None,
+                               blob_color=self._blob_color_bgr,
+                               blob_thickness=self._blob_thickness)
+
+        out_path = filedialog.asksaveasfilename(
+            title='儲存結果圖片',
+            defaultextension='.png',
+            initialfile=f'result_{path.stem}.png',
+            filetypes=[('PNG 圖片', '*.png'), ('JPEG 圖片', '*.jpg')]
+        )
+        if not out_path:
+            return
+        try:
+            ext = Path(out_path).suffix.lower()
+            ok, buf = cv2.imencode(ext if ext in ('.jpg', '.jpeg', '.png', '.bmp') else '.png', vis)
+            if not ok:
+                raise RuntimeError('編碼失敗')
+            buf.tofile(out_path)
+            messagebox.showinfo('完成', f'圖片已儲存：\n{out_path}')
+        except Exception as e:
+            messagebox.showerror('錯誤', str(e))
+
+    def _batch_save_frames(self):
+        if not self.images:
+            messagebox.showwarning('無資料', '請先載入圖片資料夾。')
+            return
+        out_dir = filedialog.askdirectory(title='選擇儲存資料夾')
+        if not out_dir:
+            return
+        out_dir = Path(out_dir)
+
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title('批次儲存圖片中…')
+        prog_win.configure(bg=C_BG)
+        prog_win.geometry('400x140')
+        prog_win.resizable(False, False)
+        prog_win.grab_set()
+
+        tk.Label(prog_win, text='正在儲存結果圖片，請稍候…',
+                 bg=C_BG, fg=C_TEXT,
+                 font=('微軟正黑體', 10)).pack(pady=(18, 6))
+
+        prog_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(prog_win, variable=prog_var,
+                        maximum=100, length=340).pack(pady=4)
+
+        prog_lbl_var = tk.StringVar(value='')
+        tk.Label(prog_win, textvariable=prog_lbl_var,
+                 bg=C_BG, fg=C_MUTED,
+                 font=('微軟正黑體', 8)).pack()
+
+        self._export_cancel = False
+        flat_btn(prog_win, '取消',
+                 lambda: setattr(self, '_export_cancel', True),
+                 bg=C_RED, pady=3).pack(pady=6)
+
+        blob_color = self._blob_color_bgr   # 擷取目前色彩，背景執行緒安全
+        thickness  = self._blob_thickness
+        min_area   = self._min_area
+        ub, uo, uc = self._use_blur, self._use_open, self._use_close
+        sig, ker   = self._tophat_sigma, self._tophat_kernel
+
+        def run():
+            total        = len(self.images)
+            prev_hist_v  = None
+            for i, img_path in enumerate(self.images):
+                if self._export_cancel:
+                    break
+                img = read_image_unicode(img_path)
+                if img is None:
+                    continue
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                rois = self.manual_rois if self.manual_rois else [auto_roi_rect(gray)]
+                all_blobs = []
+                for rect in rois:
+                    rx1, ry1, rx2, ry2 = rect
+                    roi_g = gray[ry1:ry2, rx1:rx2]
+                    if roi_g.size == 0:
+                        all_blobs.append([])
+                        continue
+                    if self.method == 'B':
+                        binary, _ = detect_method_b(roi_g, sig, ker)
+                    else:
+                        binary = detect_method_a(roi_g, self.thresh, ub, uo, uc)
+                    all_blobs.append(find_blobs(binary, min_area))
+
+                cnt = sum(len(b) for b in all_blobs)
+                rx1, ry1, rx2, ry2 = rois[0]
+                rh   = gray[ry1:ry2, rx1:rx2]
+                cur_h = compute_hist(rh if rh.size > 0 else gray)
+                d_val = chi2_dist(prev_hist_v, cur_h) if prev_hist_v is not None else 0.0
+                prev_hist_v = cur_h.copy()
+                wet = (d_val > HIST_CHANGE_THRESH) or (cnt > 30)
+
+                vis = draw_overlay(img, rois, all_blobs, wet, False, None,
+                                   blob_color=blob_color, blob_thickness=thickness)
+                fh, fw = vis.shape[:2]
+                label = f"#{i+1}/{total}  drops={cnt}"
+                cv2.putText(vis, label, (10, fh - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(vis, label, (10, fh - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (200, 200, 200), 1, cv2.LINE_AA)
+
+                out_file = out_dir / f'result_{img_path.stem}.png'
+                ok, buf = cv2.imencode('.png', vis)
+                if ok:
+                    buf.tofile(str(out_file))
+
+                pct = (i + 1) / total * 100
+                self.root.after(0, prog_var.set, pct)
+                self.root.after(0, prog_lbl_var.set,
+                                f'幀 {i+1} / {total}  ({pct:.0f}%)')
+
+            cancelled = self._export_cancel
+
+            def done():
+                prog_win.destroy()
+                if cancelled:
+                    messagebox.showinfo('已取消', '批次儲存已中止。')
+                else:
+                    messagebox.showinfo('完成', f'已儲存 {total} 張圖片至：\n{out_dir}')
             self.root.after(0, done)
 
         threading.Thread(target=run, daemon=True).start()
@@ -1089,14 +1516,16 @@ class WaterDropApp:
                 all_blobs.append([])
                 continue
             if self.method == 'B':
-                binary, tophat_img = detect_method_b(roi_gray)
+                binary, tophat_img = detect_method_b(roi_gray,
+                                                     self._tophat_sigma, self._tophat_kernel)
                 tophat_show = tophat_img
             else:
-                binary = detect_method_a(roi_gray, self.thresh)
+                binary = detect_method_a(roi_gray, self.thresh,
+                                         self._use_blur, self._use_open, self._use_close)
                 tophat_show = roi_gray
             binary_show = binary
             roi_show    = roi_gray
-            all_blobs.append(find_blobs(binary))
+            all_blobs.append(find_blobs(binary, self._min_area))
 
         total_count = sum(len(b) for b in all_blobs)
 
@@ -1127,7 +1556,9 @@ class WaterDropApp:
 
         # 影像疊加
         vis = draw_overlay(img, rois, all_blobs,
-                           is_wet, self.paused, self.draw_mode)
+                           is_wet, self.paused, self.draw_mode,
+                           blob_color=self._blob_color_bgr,
+                           blob_thickness=self._blob_thickness)
 
         # 計算縮放（base = fit-to-canvas，乘上 zoom）
         cw, ch = self.CANVAS_W, self.CANVAS_H
@@ -1170,11 +1601,15 @@ class WaterDropApp:
                             all_blobs[0] if all_blobs else [],
                             d, total_count, is_wet)
 
+        # 更新左右對比（原圖 vs 偵測結果）
+        self._update_comparison(cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+                                cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+
     def _update_charts(self, roi_gray, tophat_img, binary, blobs,
                        chi2, count, is_wet):
         for ax, img, title, cmap in [
             (self._ax_roi,    roi_gray,   'ROI',    'gray'),
-            (self._ax_tophat, tophat_img, 'TopHat', 'inferno'),
+            (self._ax_tophat, tophat_img, 'TopHat', self._tophat_cmap),
         ]:
             ax.cla()
             ax.set_facecolor('#060d14')
