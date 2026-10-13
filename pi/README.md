@@ -31,9 +31,11 @@ bash test_camera.sh --fake
 # 3. 設定相機網口（相機 IP 需在同網段，例如 192.168.10.2）
 bash setup_gige_network.sh --ip 192.168.10.1/24
 
-# 4. 完整測試（約 3 分鐘）；--quick 只跑兩項
+# 4. 完整測試（約 3 分鐘）；--quick 只跑兩項，--udp 讓 Python 測試改用 UDP socket
 bash test_camera.sh
 ```
+
+`test_camera.sh` 結束代碼：0 = Python 擷取測試全部達標，1 = 有未達標，2 = 找不到相機 / 相機與 Pi 不同網段（會印出修正方式）。
 
 ## 看結果
 

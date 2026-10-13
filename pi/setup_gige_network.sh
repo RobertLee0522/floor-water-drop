@@ -72,9 +72,11 @@ if [[ "$MTU" == "auto" ]]; then
             if sudo ip link set dev "$IFACE" mtu "$m" 2>/dev/null; then MTU=$m; break; fi
         done
         sudo ip link set dev "$IFACE" mtu "$ORIG_MTU"
+        echo "採用 MTU = ${MTU}"
+        [[ $MTU -le 1500 ]] && warn "網卡不支援 jumbo frame；相機封包大小會維持 1500 左右，CPU 負擔較高"
+    else
+        echo "dry-run 不實際測試 MTU，以下以 1500 示意"
     fi
-    echo "採用 MTU = ${MTU}"
-    [[ $MTU -le 1500 ]] && warn "網卡不支援 jumbo frame；相機封包大小會維持 1500 左右，CPU 負擔較高"
 fi
 
 # ─────────── RX ring ───────────

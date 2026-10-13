@@ -16,6 +16,9 @@
 #   bash test_camera.sh -d 20                # 每項測試 20 秒（預設 10）
 #   bash test_camera.sh --quick              # 只跑 10 fps 與最高速兩項
 #   bash test_camera.sh --fake               # 不接相機，用模擬相機驗證安裝
+#   bash test_camera.sh --udp                # Python 測試改用 UDP socket（packet socket 收不到時比對用）
+#
+# 結束代碼：0 = Python 擷取測試全部達標，1 = 有未達標項目，2 = 找不到 / 無法開啟相機
 # =====================================================================
 set -uo pipefail
 
@@ -26,6 +29,7 @@ DURATION=10
 QUICK=0
 FAKE=0
 OUT=""
+PY_EXTRA=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,7 +39,8 @@ while [[ $# -gt 0 ]]; do
         -o|--outdir)   OUT="$2"; shift 2 ;;
         --quick)       QUICK=1; shift ;;
         --fake)        FAKE=1; shift ;;
-        -h|--help)     sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --udp)         PY_EXTRA=(--no-packet-socket); shift ;;
+        -h|--help)     sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "未知參數：$1"; exit 1 ;;
     esac
 done
@@ -61,7 +66,7 @@ command -v "$ARV_TOOL" >/dev/null || die "找不到 ${ARV_TOOL}，請先執行 i
 
 # ─────────── 1. 系統檢查 ───────────
 section "1. 系統檢查"
-echo "機型      : $(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
+echo "機型      : $(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')"
 echo "系統      : $(. /etc/os-release; echo "$PRETTY_NAME") / kernel $(uname -r)"
 echo "Aravis    : $("$ARV_TOOL" --version 2>&1 | head -1)"
 echo "Python    : ${PY}"
@@ -87,11 +92,35 @@ if [[ $FAKE -eq 0 ]]; then
     SPEED="$(cat "/sys/class/net/${IFACE}/speed" 2>/dev/null || echo "?")"
     echo "MTU       : ${MTU_NOW}"
     echo "連線速度  : ${SPEED} Mb/s"
-    [[ "$SPEED" == "1000" ]] || warn "${IFACE} 連線速度為 ${SPEED} Mb/s（應為 1000），請檢查網路線（需 Cat5e 以上）與 PoE 注入器"
+    if [[ ! "$SPEED" =~ ^[0-9]+$ || $SPEED -lt 1000 ]]; then
+        warn "${IFACE} 連線速度為 ${SPEED} Mb/s（應為 1000），請檢查網路線（需 Cat5e 以上）與 PoE 注入器"
+    fi
     [[ $MTU_NOW -gt 1500 ]]  || warn "MTU ${MTU_NOW}，未啟用 jumbo frame（可執行 setup_gige_network.sh 嘗試）"
 fi
 
 # ─────────── 2. 搜尋相機 ───────────
+ip2int() { local IFS=.; local a b c d; read -r a b c d <<<"$1"; echo $(( (a << 24) | (b << 16) | (c << 8) | d )); }
+
+# 相機 IP 是否落在網口任一 IPv4 位址的網段內
+in_iface_subnet() {
+    local cam_ip="$1" cidr net pfx mask
+    for cidr in $(ip -4 -o addr show dev "$IFACE" | awk '{print $4}'); do
+        net="${cidr%/*}"; pfx="${cidr#*/}"
+        mask=$(( pfx == 0 ? 0 : (0xFFFFFFFF << (32 - pfx)) & 0xFFFFFFFF ))
+        (( ($(ip2int "$net") & mask) == ($(ip2int "$cam_ip") & mask) )) && return 0
+    done
+    return 1
+}
+
+subnet_hint() {
+    local cam_ip="$1"
+    echo "相機 IP ${cam_ip} 與 Pi 的 ${IFACE}（$(ip -4 -o addr show dev "$IFACE" | awk '{print $4}' | tr '\n' ' ')）不同網段，Aravis 能找到但無法控制。處理方式："
+    echo "  1. 暫時加同網段位址：sudo ip addr add ${cam_ip%.*}.250/24 dev ${IFACE}"
+    echo "  2. 改相機 IP：${ARV_TOOL} -n \"<相機名稱>\" network mode=PersistentIP ip=<Pi 網段的新 IP> mask=255.255.255.0"
+    echo "     （相機重新上電後生效，再用 sudo ip addr del ${cam_ip%.*}.250/24 dev ${IFACE} 移除暫時位址）"
+    echo "  或執行 setup_gige_network.sh --ip ${cam_ip%.*}.1/24，讓 Pi 配合相機網段"
+}
+
 section "2. 搜尋相機"
 if [[ $FAKE -eq 1 ]]; then
     CAM="Fake_1"
@@ -114,10 +143,7 @@ else
         echo
         if [[ -n "$CAM_IPS" ]]; then
             echo "相機有回應，IP：${CAM_IPS}"
-            echo "但與 Pi 的 ${IFACE} 不同網段，Aravis 無法控制。處理方式："
-            echo "  1. 暫時加同網段位址：sudo ip addr add <相機網段>.250/24 dev ${IFACE}"
-            echo "  2. 改相機 IP：${ARV_TOOL} -n \"<相機名稱>\" network mode=PersistentIP ip=<新IP> mask=255.255.255.0"
-            echo "     或執行 setup_gige_network.sh --ip <相機網段>.1/24，讓 Pi 配合相機網段"
+            subnet_hint "$(head -1 <<<"$CAM_IPS")"
         else
             echo "沒有收到任何 GVCP 回應。請確認："
             echo "  - 相機有供電（PoE 注入器燈號）、網路線接在 ${IFACE}"
@@ -129,6 +155,12 @@ else
     if [[ -z "$CAM" ]]; then
         CAM="$(grep " (" "${OUT}/devices.txt" | head -1 | sed 's/ (.*//')"
         [[ $(grep -c " (" "${OUT}/devices.txt") -gt 1 ]] && warn "找到多台相機，使用第一台：${CAM}（可用 -n 指定）"
+    fi
+    CAM_IP="$(grep -F "${CAM} (" "${OUT}/devices.txt" | head -1 | sed -n 's/.*(\([0-9.]*\)).*/\1/p')"
+    if [[ -n "$CAM_IP" ]] && ! in_iface_subnet "$CAM_IP"; then
+        echo
+        subnet_hint "$CAM_IP"
+        die "相機與 ${IFACE} 不同網段"
     fi
 fi
 echo "測試相機：${CAM}"
@@ -148,10 +180,20 @@ FAKE_ARG=()
 [[ $FAKE -eq 1 ]] && FAKE_ARG=(--fake)
 "$PY" "$CAPTURE" "${FAKE_ARG[@]}" --camera "$CAM" --probe > "${OUT}/probe.txt" 2>&1
 PROBE_RC=$?
-sed '/^BEST_FORMAT=/d' "${OUT}/probe.txt"
+sed '/^BEST_FORMAT=/d; /^SENSOR_SIZE=/d' "${OUT}/probe.txt"
 [[ $PROBE_RC -eq 0 ]] || die "Python 無法開啟相機，請看 ${OUT}/probe.txt"
 FMT="$(sed -n 's/^BEST_FORMAT=//p' "${OUT}/probe.txt")"
 echo "建議像素格式：${FMT:-（無 Bayer8/Mono8，沿用目前格式）}"
+SENSOR="$(sed -n 's/^SENSOR_SIZE=//p' "${OUT}/probe.txt")"
+SW="${SENSOR%x*}"; SH="${SENSOR#*x}"
+echo "感測器尺寸：${SENSOR:-未知}"
+FULL=(); HALF=()
+if [[ "$SW" =~ ^[0-9]+$ && "$SH" =~ ^[0-9]+$ ]]; then
+    FULL=(-w "$SW" -h "$SH")
+    HALF=(-w "$SW" -h $((SH / 2)))
+else
+    warn "無法取得感測器尺寸，頻寬矩陣沿用相機目前的 ROI"
+fi
 
 # ─────────── 4. arv-camera-test 頻寬矩陣 ───────────
 SUMMARY="${OUT}/summary.tsv"
@@ -165,44 +207,48 @@ run_bench() {
     echo
     echo "▶ ${label}：${ARV_TEST} $* （${DURATION} 秒）"
     timeout $((DURATION + 30)) "$ARV_TEST" -n "$CAM" --auto --duration "$DURATION" "${feat[@]}" "$@" > "$log" 2>&1
-    # 每秒輸出格式："%3d frames - %7.3g MiB/s"，第一秒為暖機不列入平均
+    # 每秒輸出格式：" 11 frames/s -    2.88 MiB/s"，第一秒為暖機不列入平均
     local fps mibs
-    fps="$(awk '/frames? - .*MiB\/s/{n++; if(n>1){s+=$1; c++}} END{if(c) printf "%.1f", s/c; else print "-"}' "$log")"
-    mibs="$(awk '/frames? - .*MiB\/s/{n++; if(n>1){s+=$4; c++}} END{if(c) printf "%.1f", s/c; else print "-"}' "$log")"
+    fps="$(awk '/frames?\/s/ && /MiB\/s/{n++; if(n>1){s+=$1; c++}} END{if(c) printf "%.1f", s/c; else print "-"}' "$log")"
+    mibs="$(awk '/frames?\/s/ && /MiB\/s/{n++; if(n>1){s+=$4; c++}} END{if(c) printf "%.1f", s/c; else print "-"}' "$log")"
     getstat() { awk -v k="$1" '$1==k {print $3}' "$log" | tail -1; }
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$fps" "$mibs" \
-        "$(stat n_completed_buffers)" "$(stat n_failures)" "$(stat n_underruns)" \
-        "$(stat n_missing_packets)" "$(stat n_resent_packets)" | tee -a "$SUMMARY"
+        "$(getstat n_completed_buffers)" "$(getstat n_failures)" "$(getstat n_underruns)" \
+        "$(getstat n_missing_packets)" "$(getstat n_resent_packets)" | tee -a "$SUMMARY"
 }
 
 if [[ $FAKE -eq 0 ]]; then
     section "4. arv-camera-test 頻寬矩陣"
     echo "欄位：平均 fps、MiB/s、完成影格、失敗影格、緩衝不足、遺失封包、重送封包"
     if [[ $QUICK -eq 1 ]]; then
-        run_bench f10_full      -f 10
-        run_bench fmax_full
+        run_bench f10_full      "${FULL[@]}" -f 10
+        run_bench fmax_full     "${FULL[@]}" -f 1000
     else
-        run_bench f05_full      -f 5
-        run_bench f10_full      -f 10
-        run_bench f15_full      -f 15
-        run_bench fmax_full
-        run_bench f15_full_rt   -f 15 --realtime
-        run_bench f10_full_udp  -f 10 --no-packet-socket
+        run_bench f05_full      "${FULL[@]}" -f 5
+        run_bench f10_full      "${FULL[@]}" -f 10
+        run_bench f15_full      "${FULL[@]}" -f 15
+        # -f 1000：Aravis 會自動夾到相機在此 ROI 下的最高幀率
+        run_bench fmax_full     "${FULL[@]}" -f 1000
+        run_bench f15_full_rt   "${FULL[@]}" -f 15 --realtime
+        run_bench f10_full_udp  "${FULL[@]}" -f 10 --no-packet-socket
         # ROI 測試放最後：arv-camera-test 改的 ROI 會保留在相機上，第 5 步會恢復全幅
-        run_bench f15_half_h    -f 15 -h 1024
+        [[ ${#HALF[@]} -gt 0 ]] && run_bench f15_half_h "${HALF[@]}" -f 15
     fi
 fi
 
 # ─────────── 5. Python 擷取測試 ───────────
 section "5. Python 擷取測試（全幅，含解拜耳）"
 PY_RESULTS=()
+PY_FAILED=0
 for fps in 5 10; do
     [[ $QUICK -eq 1 && $fps -eq 5 ]] && continue
     echo
     echo "▶ python_f${fps}"
-    "$PY" "$CAPTURE" "${FAKE_ARG[@]}" --camera "$CAM" --roi full --fps "$fps" \
+    "$PY" "$CAPTURE" "${FAKE_ARG[@]}" "${PY_EXTRA[@]}" --camera "$CAM" --roi full --fps "$fps" \
         --duration $((DURATION * 2)) --save 3 --outdir "${OUT}/python_f${fps}"
-    PY_RESULTS+=("python_f${fps}: exit $?")
+    rc=$?
+    [[ $rc -eq 0 ]] || PY_FAILED=1
+    PY_RESULTS+=("python_f${fps}: exit ${rc}")
 done
 
 # ─────────── 摘要 ───────────
@@ -243,3 +289,4 @@ fi
 echo
 echo "完整紀錄：${OUT}"
 echo "請打開 ${OUT}/python_f*/frame_*.jpg 確認影像顏色正確。"
+exit "$PY_FAILED"

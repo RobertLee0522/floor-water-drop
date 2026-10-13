@@ -173,7 +173,11 @@ import gi
 gi.require_version('Aravis', '${API}')
 from gi.repository import Aravis
 import cv2, numpy
-print(f"Aravis {Aravis.get_major_version()}.{Aravis.get_minor_version()}.{Aravis.get_micro_version()}"
+# 實際呼叫函式庫：啟用模擬相機介面並開啟、讀取一個特徵
+Aravis.enable_interface('Fake')
+Aravis.update_device_list()
+cam = Aravis.Camera.new('Fake_1')
+print(f"PyGObject Aravis-{Aravis._version} OK（裝置數 {Aravis.get_n_devices()}，模擬相機 {cam.get_model_name()}）"
       f" | OpenCV {cv2.__version__} | NumPy {numpy.__version__}")
 EOF
 

@@ -257,6 +257,8 @@ def main():
         print(json.dumps(info, ensure_ascii=False, indent=2, default=str))
         best = pick_format(info['available_formats'] or [])
         print(f'BEST_FORMAT={best or ""}')
+        size = info['sensor_size']
+        print(f'SENSOR_SIZE={size[0]}x{size[1]}' if size else 'SENSOR_SIZE=')
         return 0
 
     outdir = Path(args.outdir or f'output/capture_{datetime.now():%Y%m%d_%H%M%S}')
@@ -413,7 +415,8 @@ def main():
     print(f"成功 / 失敗   : {n_ok} / {n_bad} {n_bad_status or ''}（成功率 {success_ratio:.2%}）")
     print(f"實際 fps      : {summary['fps_measured']}（目標 {args.fps}）≈ {summary['throughput_mbps']} Mbps")
     print(f"frame id 跳號 : {n_frame_id_gaps}    pop 逾時：{n_pop_timeouts}")
-    for key in ('n_missing_packets', 'n_resent_packets', 'n_resend_requests', 'n_missing_frames', 'n_underruns'):
+    for key in ('n_received_packets', 'n_missing_packets', 'n_resent_packets', 'n_resend_requests',
+                'n_missing_frames', 'n_underruns'):
         if key in stream_stats:
             print(f"{key:<14}: {stream_stats[key]}")
     print(f"CPU（本程序） : {summary['cpu_percent_process']}%（100% = 一個核心）")
@@ -422,6 +425,12 @@ def main():
         print(f"解拜耳        : 平均 {summary['debayer_ms_mean']} ms，p95 {summary['debayer_ms_p95']} ms")
     print(f"單執行緒處理上限 ≈ {summary['single_thread_process_fps_limit']} fps（複製 + 解拜耳）")
     print(f"結果          : {'通過' if passed else '未達標'}")
+    if n_ok == 0 and n_bad == 0:
+        if stream_stats.get('n_received_packets', 0) == 0:
+            print('[診斷] 完全沒收到影像封包：檢查防火牆（UDP）、相機與 Pi 是否同網段'
+                  + ('；也可加 --no-packet-socket 比對 UDP 模式' if use_packet_socket else ''))
+        else:
+            print('[診斷] 有收到封包但沒有組成完整影格：檢查封包大小 / MTU，或降低 fps')
     print(f"輸出          : {outdir.resolve()}")
     if saved:
         print('請打開存下的 jpg 確認顏色：若紅藍對調或出現格紋，表示 Bayer 轉換碼不對，可用 --cv-pattern BG/RG/GB/GR 試換。')
