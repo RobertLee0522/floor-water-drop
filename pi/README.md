@@ -18,8 +18,9 @@
 ## 步驟
 
 ```bash
-# 0. 把整個 pi/ 資料夾複製到 Pi（建議 git clone，或 scp -r pi/ pi@<Pi IP>:~/floor-pi/）
-cd ~/floor-pi
+# 0. 取得程式碼
+git clone https://github.com/RobertLee0522/floor-water-drop.git ~/floor-water-drop
+cd ~/floor-water-drop/pi
 
 # 1. 安裝（約 5–10 分鐘）
 bash install_aravis.sh

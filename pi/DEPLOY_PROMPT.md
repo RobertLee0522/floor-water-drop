@@ -1,6 +1,6 @@
 # Raspberry Pi 5 部署 Prompt
 
-在 Pi 上的 Claude Code（於 `~/floor-pi` 目錄啟動）貼上以下內容。
+先 `git clone https://github.com/RobertLee0522/floor-water-drop.git ~/floor-water-drop`，在 `~/floor-water-drop/pi` 目錄啟動 Claude Code，貼上以下內容。測試輸出會寫到 `~/floor-water-drop/output/`（已在 .gitignore）。
 
 ---
 
