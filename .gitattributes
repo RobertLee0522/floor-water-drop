@@ -1,0 +1,3 @@
+# Raspberry Pi 上執行的腳本固定用 LF，避免 core.autocrlf 轉成 CRLF 後 bash 出現 $'\r' 錯誤
+pi/*.sh text eol=lf
+pi/*.py text eol=lf
