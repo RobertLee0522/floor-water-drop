@@ -100,6 +100,15 @@ def try_call(fn, *a, default=None):
         return default
 
 
+def sensor_size(camera):
+    """感測器尺寸；相機沒有 SensorWidth/SensorHeight 時改用 Width/Height 的最大值。"""
+    size = try_call(camera.get_sensor_size)
+    if size:
+        return size
+    wb, hb = try_call(camera.get_width_bounds), try_call(camera.get_height_bounds)
+    return (wb[1], hb[1]) if wb and hb else None
+
+
 def read_stream_stats(stream):
     stats = {}
     try:
@@ -130,7 +139,7 @@ def camera_info(camera):
         'model': try_call(camera.get_model_name),
         'serial': try_call(camera.get_device_serial_number),
         'is_gige': camera.is_gv_device(),
-        'sensor_size': try_call(camera.get_sensor_size),
+        'sensor_size': sensor_size(camera),
         'region': try_call(camera.get_region),
         'pixel_format': try_call(camera.get_pixel_format_as_string),
         'available_formats': try_call(camera.dup_available_pixel_formats_as_strings, default=[]),
@@ -180,11 +189,21 @@ def parse_args():
 
 def open_camera(name):
     try:
-        return Aravis.Camera.new(name)
+        camera = Aravis.Camera.new(name)
     except (GLib.Error, TypeError) as e:
         print(f'[錯誤] 無法開啟相機 {name or "(第一台)"}：{e}')
         print('        請先執行 arv-tool-0.8 確認相機有被找到。')
         sys.exit(2)
+    # 部分相機（如 Jinghang JHEM600GC）開啟時 Aravis 未取得控制權，
+    # 寫入一律 access-denied，需明確 take_control
+    device = camera.get_device()
+    if hasattr(device, 'take_control'):
+        try:
+            if not device.take_control():
+                print('[警告] 無法取得相機控制權，可能有其他主機正在使用')
+        except GLib.Error as e:
+            print(f'[警告] 取得相機控制權失敗：{e.message}')
+    return camera
 
 
 def configure(camera, args):
@@ -209,7 +228,7 @@ def configure(camera, args):
         attempt(f'設定像素格式 {fmt}', camera.set_pixel_format_from_string, fmt)
 
     if args.roi == 'full':
-        w, h = camera.get_sensor_size()
+        w, h = sensor_size(camera) or camera.get_sensor_size()
         attempt(f'設定全幅 ROI {w}x{h}', camera.set_region, 0, 0, w, h)
     elif args.roi:
         x, y, w, h = (int(v) for v in args.roi.split(','))
@@ -332,6 +351,11 @@ def main():
             sys_ts_ns = buf.get_system_timestamp()
             stream.push_buffer(buf)
             t1 = time.perf_counter()
+
+            # 偶爾 status 為 SUCCESS 但資料不足一張（實測 Jinghang 少 428 bytes），算失敗
+            if len(data) < width * height:
+                n_bad_status['short_frame'] = n_bad_status.get('short_frame', 0) + 1
+                continue
             copy_ms.append((t1 - t0) * 1000)
 
             dbr = None

@@ -67,11 +67,14 @@ if [[ "$MTU" == "auto" ]]; then
     ORIG_MTU="$(cat "/sys/class/net/${IFACE}/mtu")"
     MTU=1500
     if [[ $DRY_RUN -eq 0 ]]; then
+        # 部分驅動（如 Pi 5 的 macb）在網口 up 時改 MTU 會回 EBUSY，需先 down
+        sudo ip link set dev "$IFACE" down
         for m in 9000 8192 7200 4096 3000 1500; do
             [[ -n "$MAXMTU" && $m -gt $MAXMTU ]] && continue
             if sudo ip link set dev "$IFACE" mtu "$m" 2>/dev/null; then MTU=$m; break; fi
         done
         sudo ip link set dev "$IFACE" mtu "$ORIG_MTU"
+        sudo ip link set dev "$IFACE" up
         echo "採用 MTU = ${MTU}"
         [[ $MTU -le 1500 ]] && warn "網卡不支援 jumbo frame；相機封包大小會維持 1500 左右，CPU 負擔較高"
     else
@@ -105,6 +108,12 @@ if nmcli connection show "$CON_NAME" >/dev/null 2>&1; then
     run sudo nmcli connection modify "$CON_NAME" "${PROPS[@]}"
 else
     run sudo nmcli connection add type ethernet con-name "$CON_NAME" "${PROPS[@]}"
+fi
+if [[ $DRY_RUN -eq 0 && "$(cat "/sys/class/net/${IFACE}/mtu")" != "$MTU" ]]; then
+    # NetworkManager 在網口 up 時套用 MTU，macb 會回 EBUSY 而靜默失敗：先 down 設好 MTU 再啟用
+    run sudo nmcli device disconnect "$IFACE"
+    run sudo ip link set dev "$IFACE" down
+    run sudo ip link set dev "$IFACE" mtu "$MTU"
 fi
 run sudo nmcli connection up "$CON_NAME"
 
