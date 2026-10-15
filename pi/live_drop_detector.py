@@ -128,6 +128,9 @@ ROW_THRESH_RATIO = 1.3
 ROI_PADDING = 30
 ROI_COLORS = [(0, 220, 255), (255, 120, 0), (180, 0, 255), (0, 255, 120), (255, 0, 160)]
 SNAPSHOT_W = 1280           # 事件截圖寬度
+FLUSH_SEC = 60              # 監測紀錄每隔幾秒寫進硬碟一次
+CHART_POINTS = 2000         # 記憶體中曲線最少保留的點數（超過 2 倍就兩兩合併）
+REPORT_MAX_EVENTS = 50      # 報表頁最多顯示幾個事件縮圖（全部看匯出的 HTML）
 
 C_BG, C_PANEL, C_CARD, C_BTN = '#0f172a', '#1e293b', '#334155', '#475569'
 C_TEXT, C_MUTED = '#e2e8f0', '#94a3b8'
@@ -259,7 +262,11 @@ class Grabber(threading.Thread):
 # ─────────── 監測紀錄 ───────────
 
 class Session:
-    """一次監測：每張影像的紀錄 + WET 事件 + 截圖。"""
+    """一次監測：每張影像的紀錄 + WET 事件 + 截圖。
+
+    長時間監測也不累積記憶體：每張紀錄每 FLUSH_SEC 秒追加寫進 frames.csv，記憶體只留統計值與
+    降取樣後的曲線；事件截圖寫成 JPG 後就丟掉，報表要用時再從硬碟讀。
+    """
 
     def __init__(self, params, rois):
         self.start = datetime.now()
@@ -268,10 +275,38 @@ class Session:
         (self.dir / 'events').mkdir(parents=True, exist_ok=True)
         self.params = dict(params)
         self.rois = list(rois)
-        self.records = []           # (經過秒數, 水滴數, wet, chi2)
-        self.events = []            # dict: id, start, end, max_drops, image(記憶體), file
+        self.events = []            # dict: id, start, end, max_drops, image(只有進行中的事件), file
         self._open = None
         self.loaded = False         # True：從硬碟讀回的舊紀錄
+        self._init_stats()
+        self._pending = []          # 還沒寫進 frames.csv 的紀錄 (經過秒數, 水滴數, wet, chi2)
+        self._last_flush = time.monotonic()
+        with open(self.dir / 'frames.csv', 'w', newline='', encoding='utf-8-sig') as f:
+            csv.writer(f).writerow(['elapsed_s', 'time', 'drops', 'wet', 'hist_chi2'])
+
+    def _init_stats(self):
+        self.n_frames = self.n_wet = self.sum_drops = 0
+        self.max_drops = None
+        self.last_t = 0.0
+        self.series = []            # 曲線用 [經過秒數, 區間內最大水滴數]，點數固定在 CHART_POINTS～2 倍之間
+        self._bucket, self._bucket_fill = 1, 0
+
+    def _track(self, t, n, wet):
+        self.n_frames += 1
+        self.n_wet += bool(wet)
+        self.sum_drops += n
+        self.max_drops = n if self.max_drops is None else max(self.max_drops, n)
+        self.last_t = t
+        if self._bucket_fill == 0:
+            self.series.append([t, n])
+        else:
+            self.series[-1][1] = max(self.series[-1][1], n)
+        self._bucket_fill = (self._bucket_fill + 1) % self._bucket
+        if len(self.series) >= 2 * CHART_POINTS:     # 點太多：相鄰兩點合併（取最大值保留尖峰）
+            s = self.series
+            self.series = [[s[i][0], max(s[i][1], s[i + 1][1])] for i in range(0, len(s), 2)]
+            self._bucket *= 2
+            self._bucket_fill = 0
 
     @property
     def running(self):
@@ -282,10 +317,11 @@ class Session:
 
     def add(self, n, wet, chi2, vis_bgr):
         t = self.elapsed()
-        self.records.append((t, n, wet, chi2))
+        self._track(t, n, wet)
+        self._pending.append((t, n, wet, chi2))
         if wet and self._open is None:
             self._open = {'id': len(self.events) + 1, 'start': t, 'end': t, 'max_drops': -1,
-                          'image': None, 'file': None}
+                          'image': None, 'file': None, 'dirty': False}
             self.events.append(self._open)
         if self._open is not None:
             ev = self._open
@@ -295,91 +331,118 @@ class Session:
                 h, w = vis_bgr.shape[:2]
                 ev['image'] = cv2.resize(vis_bgr, (SNAPSHOT_W, int(h * SNAPSHOT_W / w)),
                                          interpolation=cv2.INTER_AREA)
+                ev['dirty'] = True
             if not wet:
-                self._write_snapshot(ev)
-                self._open = None
+                self._close_event()
+        if time.monotonic() - self._last_flush >= FLUSH_SEC:
+            self.flush()
+
+    def _close_event(self):
+        ev, self._open = self._open, None
+        self._write_snapshot(ev)
+        ev['image'] = None          # 已存成 JPG，不再佔記憶體
 
     def _write_snapshot(self, ev):
-        if ev['image'] is not None:
+        if ev['image'] is not None and ev.get('dirty', True):
             ev['file'] = f"events/event_{ev['id']:03d}.jpg"
             cv2.imwrite(str(self.dir / ev['file']), ev['image'], [cv2.IMWRITE_JPEG_QUALITY, 88])
+            ev['dirty'] = False
+
+    def flush(self):
+        """把累積的紀錄追加寫進 frames.csv，並更新 session.json；程式中斷時最多只少最後一段。"""
+        self._last_flush = time.monotonic()
+        if self.loaded:
+            return
+        if self._pending:
+            t0 = self.start.timestamp()
+            with open(self.dir / 'frames.csv', 'a', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                for t, n, wet, d in self._pending:
+                    ts = datetime.fromtimestamp(t0 + t).strftime('%H:%M:%S.%f')[:-3]
+                    w.writerow([f'{t:.3f}', ts, n, int(wet), f'{d:.4f}'])
+            self._pending = []
+        if self._open is not None:
+            self._write_snapshot(self._open)     # 進行中的事件先存一張目前的截圖
+        self._write_meta()
+
+    def _write_meta(self):
+        meta = {'start': self.start.isoformat(), 'end': self.end.isoformat() if self.end else None,
+                'params': self.params, 'rois': [list(r) for r in self.rois],
+                'events': [{k: ev[k] for k in ('id', 'start', 'end', 'max_drops', 'file')} for ev in self.events]}
+        (self.dir / 'session.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def stop(self):
         if self._open is not None:
-            self._write_snapshot(self._open)
-            self._open = None
+            self._close_event()
         self.end = datetime.now()
+        self.flush()
+
+    def event_image(self, ev):
+        """事件截圖：進行中的事件在記憶體，其他從 JPG 以 1/2 解碼讀回（不快取，報表縮圖夠用）。"""
+        if ev.get('image') is not None:
+            return ev['image']
+        if ev['file'] and (self.dir / ev['file']).exists():
+            return cv2.imread(str(self.dir / ev['file']), cv2.IMREAD_REDUCED_COLOR_2)
+        return None
 
     def summary(self):
-        recs = self.records
         dur = self.elapsed()
-        drops = [r[1] for r in recs]
-        n_wet = sum(1 for r in recs if r[2])
+        n = self.n_frames
         wet_time = sum(e['end'] - e['start'] for e in self.events)
         return {
             '開始時間': self.start.strftime('%Y-%m-%d %H:%M:%S'),
             '結束時間': self.end.strftime('%Y-%m-%d %H:%M:%S') if self.end else '監測中',
             '監測時間': fmt_duration(dur),
-            '處理影像數': f'{len(recs)}',
-            '平均處理速度': f'{len(recs) / dur:.1f} fps' if dur > 0 else '-',
+            '處理影像數': f'{n}',
+            '平均處理速度': f'{n / dur:.1f} fps' if dur > 0 else '-',
             'WET 事件數': f'{len(self.events)}',
-            'WET 影像比例': f'{n_wet / len(recs):.1%}' if recs else '-',
+            'WET 影像比例': f'{self.n_wet / n:.1%}' if n else '-',
             'WET 累計時間': fmt_duration(wet_time),
-            '最大水滴數': f'{max(drops)}' if drops else '-',
-            '平均水滴數': f'{np.mean(drops):.1f}' if drops else '-',
+            '最大水滴數': f'{self.max_drops}' if n else '-',
+            '平均水滴數': f'{self.sum_drops / n:.1f}' if n else '-',
         }
 
     def export(self):
         """寫出 frames.csv、session.json 與 report.html，回傳 report.html 路徑。"""
-        if self._open is not None:
-            self._write_snapshot(self._open)     # 進行中的事件先存一張目前的截圖
-        if not self.loaded:
-            with open(self.dir / 'frames.csv', 'w', newline='', encoding='utf-8-sig') as f:
-                w = csv.writer(f)
-                w.writerow(['elapsed_s', 'time', 'drops', 'wet', 'hist_chi2'])
-                for t, n, wet, d in self.records:
-                    ts = datetime.fromtimestamp(self.start.timestamp() + t).strftime('%H:%M:%S.%f')[:-3]
-                    w.writerow([f'{t:.3f}', ts, n, int(wet), f'{d:.4f}'])
-        meta = {'start': self.start.isoformat(), 'end': self.end.isoformat() if self.end else None,
-                'params': self.params, 'rois': [list(r) for r in self.rois],
-                'events': [{k: ev[k] for k in ('id', 'start', 'end', 'max_drops', 'file')} for ev in self.events]}
-        (self.dir / 'session.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+        if self.loaded:
+            self._write_meta()
+        else:
+            self.flush()
         path = self.dir / 'report.html'
         path.write_text(render_html(self), encoding='utf-8')
         return path
 
-
     @classmethod
     def load(cls, folder):
-        """從 output/sessions/<開始時間>/ 讀回一次監測（報表頁看舊紀錄用）。"""
+        """從 output/sessions/<開始時間>/ 讀回一次監測（報表頁看舊紀錄用）。紀錄邊讀邊統計，不整份留在記憶體。"""
         s = cls.__new__(cls)
-        s.dir, s._open, s.loaded = folder, None, True
-        s.records, first_time = [], None
-        with open(folder / 'frames.csv', newline='', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
-                first_time = first_time or row['time']
-                s.records.append((float(row['elapsed_s']), int(row['drops']), row['wet'] == '1',
-                                  float(row['hist_chi2'])))
+        s.dir, s._open, s.loaded, s._pending = folder, None, True, []
+        s._init_stats()
         try:
             meta = json.loads((folder / 'session.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             meta = None
+        legacy, first_time = [], None       # 舊版沒有 session.json，事件要從紀錄重建
+        with open(folder / 'frames.csv', newline='', encoding='utf-8-sig') as f:
+            for row in csv.DictReader(f):
+                first_time = first_time or row['time']
+                rec = (float(row['elapsed_s']), int(row['drops']), row['wet'] == '1', float(row['hist_chi2']))
+                s._track(*rec[:3])
+                if meta is None:
+                    legacy.append(rec)
         if meta:
             s.start = datetime.fromisoformat(meta['start'])
             s.end = datetime.fromisoformat(meta['end']) if meta.get('end') else None
             s.params, s.rois = meta['params'], [tuple(r) for r in meta['rois']]
             s.events = [dict(ev, image=None) for ev in meta['events']]
         else:
-            # 舊版沒有 session.json：時間由資料夾名稱 + 第一筆紀錄推回，事件由 wet 欄位重建
-            s.start = _legacy_start(folder.name, first_time, s.records)
+            # 時間由資料夾名稱 + 第一筆紀錄推回，事件由 wet 欄位重建
+            s.start = _legacy_start(folder.name, first_time, legacy)
             s.end = None
             s.params, s.rois = _legacy_params(folder / 'report.html')
-            s.events = _rebuild_events(s.records, folder)
-        if s.end is None:           # 監測中途匯出或程式中斷：以最後一筆紀錄當結束時間
-            s.end = datetime.fromtimestamp(s.start.timestamp() + (s.records[-1][0] if s.records else 0))
-        for ev in s.events:         # 截圖用 1/2 解碼，報表縮圖夠用又省記憶體
-            if ev['file'] and (folder / ev['file']).exists():
-                ev['image'] = cv2.imread(str(folder / ev['file']), cv2.IMREAD_REDUCED_COLOR_2)
+            s.events = _rebuild_events(legacy, folder)
+        if s.end is None:           # 監測中途中斷：以最後一筆紀錄當結束時間
+            s.end = datetime.fromtimestamp(s.start.timestamp() + s.last_t)
         return s
 
 
@@ -437,7 +500,7 @@ def _rebuild_events(records, folder):
 # ─────────── HTML 報表 ───────────
 
 def chart_svg(session, width=1000, height=280):
-    recs = session.records
+    recs = session.series
     pad_l, pad_r, pad_t, pad_b = 48, 16, 14, 34
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
     dur = max(session.elapsed(), 1e-6)
@@ -1093,11 +1156,17 @@ class LiveDropApp:
             c.create_text(0, y + 16, text='監測期間沒有 WET 事件', fill=C_MUTED, font=(FONT, 15), anchor='w')
             y += 44
         tw = 330
-        for ev in s.events:
-            th = int(ev['image'].shape[0] * tw / ev['image'].shape[1]) if ev['image'] is not None else 160
+        shown = s.events[-REPORT_MAX_EVENTS:]
+        if len(shown) < len(s.events):
+            c.create_text(0, y + 12, text=f'只列出最近 {len(shown)} 個事件，全部事件請按「匯出並開啟 HTML」',
+                          fill=C_MUTED, font=(FONT, 14), anchor='w')
+            y += 36
+        for ev in shown:
+            img = s.event_image(ev)
+            th = int(img.shape[0] * tw / img.shape[1]) if img is not None else 160
             c.create_rectangle(0, y, W, y + th + 12, fill=C_PANEL, outline='')
-            if ev['image'] is not None:
-                photo = to_photo(ev['image'], tw, th)
+            if img is not None:
+                photo = to_photo(img, tw, th)
                 self._report_photos.append(photo)
                 c.create_image(6, y + 6, image=photo, anchor='nw')
             t0 = datetime.fromtimestamp(s.start.timestamp() + ev['start'])
@@ -1124,7 +1193,7 @@ class LiveDropApp:
         pw, ph = w - pl - pr, h - pt - pb
         dur = max(s.elapsed(), 1e-6)
         thresh = s.params.get('wet_count', DETECT_DEFAULTS['wet_count'])
-        recs = s.records
+        recs = s.series
         ymax = max([r[1] for r in recs] + [thresh]) * 1.1 or 1
         X = lambda t: x0 + pl + t / dur * pw
         Y = lambda v: y0 + pt + ph - v / ymax * ph
