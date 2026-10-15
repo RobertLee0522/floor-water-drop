@@ -59,9 +59,21 @@ CAMERA_DEFAULTS = {
     'wb_red': 2100,
     'wb_blue': 1750,
 }
-# Jinghang JHEM600GC 感測器實際排列是 G B / R G；設成其他 Bayer 格式時相機只改標籤、
-# 資料排列不變，解拜耳會整張偏綠，所以固定用 BayerGB8
-PIXEL_FORMAT = 'BayerGB8'
+# Jinghang 相機設成其他 Bayer 格式時只改標籤、資料排列不變，標錯會整張偏綠，
+# 所以依型號固定用感測器實際的排列（以紅色輸送帶實拍比對確認）
+PIXEL_FORMAT_BY_MODEL = {
+    'JHEM600GC': 'BayerGB8',
+    'JHEM131GC': 'BayerBG8',
+}
+PIXEL_FORMAT_FALLBACK = 'BayerGB8'
+BAYER_CHOICES = ('BayerGB8', 'BayerBG8')     # 介面上可手動選的排列
+
+
+def pixel_format_for(model):
+    for key, fmt in PIXEL_FORMAT_BY_MODEL.items():
+        if key in (model or ''):
+            return fmt
+    return PIXEL_FORMAT_FALLBACK
 
 # 偵測參數預設值（與 地板/water_drop_detector.py 相同）
 DETECT_DEFAULTS = {
@@ -121,6 +133,7 @@ PARAM_HELP = {
     'scale': '偵測前先把影像縮小的比例，1.0為原尺寸。\n上方「偵測ms」太大→調小（較快）\n小水滴縮小後消失→調大（較準、較慢）\n面積與範圍大小會自動換算，不用跟著改。',
     'wet_count': '畫面中水滴數超過此值就判定WET。\n沒水卻常跳WET→調大\n有水卻一直DRY→調小',
     'hist_thresh': '和上一張比，畫面亮度分佈的變化量超過此值也判定WET（抓整片水漬、積水這類突然變化）。\n燈光閃爍、有人走過就誤判→調大\n大片水漬出現卻沒反應→調小',
+    'bayer': '感測器的紅綠藍排列方式，選錯整張畫面會偏綠或偏藍，偵測也會受影響。\n自動：依相機型號選（JHEM600GC→GB8、JHEM131GC→BG8）\n換了相機、紅色東西拍起來變綠→改選另一個\n選擇會記住，下次開啟沿用。',
     'wet_frames': '要連續幾張都符合，才在DRY/WET之間切換，避免狀態閃爍。\n狀態跳來跳去→調大\n反應太慢→調小\n延遲秒數約=張數÷幀率',
 }
 METHOD_ONLY = {'sigma': 'B', 'kernel': 'B', 'thresh': 'A'}     # 只有該偵測方法才用到的參數
@@ -612,6 +625,8 @@ class LiveDropApp:
         self._shown_method = None   # 偵測分頁目前列出哪個方法的參數
         self._help_job = None       # 畫面上說明框的自動關閉計時
 
+        self.model = try_call(camera.get_model_name, default='') or ''
+        self.bayer = 'auto'         # 顏色排列：'auto' 或 BAYER_CHOICES 之一
         self.rois = []              # 手動 ROI（原圖座標）
         self._drag = None
         self.paused = False
@@ -675,6 +690,22 @@ class LiveDropApp:
                 self._set_wb('Blue', value)
         except GLib.Error as e:
             print(f'[警告] 設定 {key}={value} 失敗：{e.message}')
+
+    def set_bayer(self, choice):
+        # 相機改格式只換標籤、資料排列不變，所以只要換解拜耳方式，不必停止擷取
+        self.bayer = choice
+        self.grabber.pixel_format = pixel_format_for(self.model) if choice == 'auto' else choice
+        self._refresh_bayer()
+        self._save_bayer()
+
+    def _refresh_bayer(self):
+        if self.group != '相機':
+            return
+        for v, b in self.bayer_btns.items():
+            c = C_ACCENT if self.bayer == v else C_BTN
+            b.config(bg=c, activebackground=c)
+        auto = pixel_format_for(self.model).replace('Bayer', '')
+        self.bayer_btns['auto'].config(text=f'自動 {auto}')
 
     # ── UI 元件 ──
     def _btn(self, parent, text, cmd, bg=C_CARD, size=16, repeat=False, **kw):
@@ -805,6 +836,18 @@ class LiveDropApp:
             for w in (row, left, *left.winfo_children()):      # 點參數名稱看說明
                 w.bind('<ButtonPress-1>', lambda e, k=key: self._show_help(k))
         if name == '相機':
+            row = tk.Frame(f, bg=C_CARD)
+            row.pack(fill='x', pady=3)
+            lbl = tk.Label(row, text='顏色\n排列', bg=C_CARD, fg=C_MUTED, font=(FONT, 12))
+            lbl.pack(side='left', padx=(10, 6))
+            lbl.bind('<ButtonPress-1>', lambda e: self._show_help('bayer'))
+            self.bayer_btns = {}
+            for val in ('auto', *BAYER_CHOICES):
+                b = self._btn(row, val.replace('Bayer', ''),
+                              lambda v=val: (self.set_bayer(v), self._show_help('bayer')), bg=C_BTN, size=14)
+                b.pack(side='left', expand=True, fill='x', padx=2, pady=4, ipady=6)
+                self.bayer_btns[val] = b
+            self._refresh_bayer()
             self._btn(f, '自動白平衡（畫面中央放白紙）', self.auto_wb, size=14).pack(fill='x', pady=6, ipady=10)
         # 說明區：填滿面板剩下的空白
         self.help_lbl = tk.Label(f, text='', bg=C_PANEL, fg=C_TEXT, font=(FONT, 13), justify='left', anchor='nw',
@@ -817,7 +860,7 @@ class LiveDropApp:
         if key is None:
             text = GROUP_HELP[self.group]
         else:
-            name = '偵測方法' if key == 'method' else self.specs[key][1]
+            name = {'method': '偵測方法', 'bayer': '顏色排列'}.get(key) or self.specs[key][1]
             text = f'【{name}】\n{PARAM_HELP[key]}'
         self.hide_help_overlay()
         self.help_lbl.config(text=text)
@@ -916,6 +959,8 @@ class LiveDropApp:
             saved = json.loads(SETTINGS_FILE.read_text())
             params.update({k: v for k, v in saved.get('params', {}).items() if k in params})
             self.rois = [tuple(r) for r in saved.get('rois', [])]
+            if saved.get('bayer') in BAYER_CHOICES:
+                self.set_bayer(saved['bayer'])
         except (OSError, ValueError):
             pass
         self._apply_all(params, force=True)
@@ -923,8 +968,18 @@ class LiveDropApp:
 
     def _save_settings(self):
         OUTPUT_DIR.mkdir(exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps({'params': self.params, 'rois': self.rois},
+        SETTINGS_FILE.write_text(json.dumps({'params': self.params, 'rois': self.rois, 'bayer': self.bayer},
                                             ensure_ascii=False, indent=2))
+
+    def _save_bayer(self):
+        # 顏色排列選了就記住（不必等按「存檔」），其他參數維持檔案裡原本的值
+        try:
+            saved = json.loads(SETTINGS_FILE.read_text())
+        except (OSError, ValueError):
+            saved = {}
+        saved['bayer'] = self.bayer
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        SETTINGS_FILE.write_text(json.dumps(saved, ensure_ascii=False, indent=2))
 
     # ── 白平衡 ──
     def auto_wb(self):
@@ -1409,12 +1464,29 @@ def main():
     ap.add_argument('--fullscreen', action='store_true', help='全螢幕開啟')
     args = ap.parse_args()
 
-    camera = open_camera(None)
-    try_call(camera.clear_triggers)
     try:
-        camera.set_pixel_format_from_string(PIXEL_FORMAT)
+        camera = open_camera(None)
+    except SystemExit:
+        # 桌面捷徑啟動時看不到終端機，改用視窗提示，避免點了像沒反應
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            '水滴偵測',
+            '找不到相機，無法開啟。\n\n'
+            '請確認：\n'
+            '1. 相機網路線插在 Pi 的網口，且相機有電\n'
+            '2. 沒有其他電腦（廠商軟體）正在使用這台相機\n\n'
+            '詳細訊息：output/live_app.log')
+        root.destroy()
+        return 2
+    try_call(camera.clear_triggers)
+    model = try_call(camera.get_model_name, default='')
+    pixel_format = pixel_format_for(model)
+    try:
+        camera.set_pixel_format_from_string(pixel_format)
     except GLib.Error as e:
-        print(f'[警告] 設定像素格式 {PIXEL_FORMAT} 失敗：{e.message}')
+        print(f'[警告] 設定像素格式 {pixel_format} 失敗：{e.message}')
     if camera.is_gv_device():
         try:
             camera.gv_auto_packet_size()
