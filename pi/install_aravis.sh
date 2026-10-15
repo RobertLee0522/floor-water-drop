@@ -72,7 +72,7 @@ PKGS=(
     build-essential meson ninja-build pkg-config curl xz-utils
     libglib2.0-dev libxml2-dev zlib1g-dev
     gobject-introspection
-    python3-gi python3-numpy python3-opencv python3-venv
+    python3-gi python3-numpy python3-opencv python3-venv python3-pil.imagetk
     libcap2-bin ethtool tcpdump
 )
 # libgirepository1.0-dev 提供 gobject-introspection-1.0.pc（編譯 typelib 用）

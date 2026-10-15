@@ -24,23 +24,29 @@ import argparse
 import csv
 import html
 import json
+import re
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aravis_capture_test import Aravis, GLib, open_camera, to_bgr, try_call
 import cv2
 import numpy as np
+try:
+    from PIL import Image, ImageTk     # apt: python3-pil.imagetk；貼圖比 Tk 解析 PPM 快很多
+except ImportError:
+    Image = ImageTk = None
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / 'output'
 SETTINGS_FILE = OUTPUT_DIR / 'live_settings.json'
 SESSIONS_DIR = OUTPUT_DIR / 'sessions'
 
 WIN_W, WIN_H = 1280, 800
+VIEW_STRIPS = 4             # 即時畫面拆成幾條橫帶分次貼上，每次只佔主執行緒一小段，觸控不卡
 TOP_H = 84
 PANEL_W = 400
 VIEW_W, VIEW_H = WIN_W - PANEL_W - 12, WIN_H - TOP_H - 12
@@ -94,6 +100,30 @@ PARAM_GROUPS = {
         ('wet_frames', '連續幾張才切換', 1, 30, 1, 0),
     ],
 }
+# 參數說明：點參數名稱或按 −/＋ 時顯示在面板空白處
+GROUP_HELP = {
+    '相機': '調整相機拍攝設定。\n點參數名稱可看說明。\n\n建議順序：先調曝光讓水滴清楚、背景不過曝，不夠亮再加增益。',
+    '偵測': '決定「怎樣的亮點算水滴」。\n點參數名稱可看說明。\n\n誤判（沒水卻有圈）→調嚴；漏抓（有水沒圈）→調鬆。看左邊畫面的黃色圓圈即時確認。',
+    '判定': '決定何時從DRY切成WET。\n點參數名稱可看說明。',
+}
+PARAM_HELP = {
+    'exposure_ms': '每張影像的感光時間。\n畫面太暗→調大\n太亮、反光過曝、水滴拖影→調小\n曝光超過1000÷幀率毫秒時，幀率會上不去。',
+    'gain': '用電子訊號放大亮度。\n曝光已經加到不能再加時才調大。\n越大雜訊越多，容易把雜訊誤判成水滴，能用0就用0。',
+    'fps': '每秒拍幾張。\n調大→反應較快，但Pi負擔較重\n上方「偵測ms」很大、畫面卡頓→調小',
+    'wb_red': '白平衡紅色比例，只影響畫面顏色，對偵測幾乎沒影響。\n畫面偏藍綠→調大\n畫面偏紅→調小\n也可以用下方「自動白平衡」。',
+    'wb_blue': '白平衡藍色比例，只影響畫面顏色，對偵測幾乎沒影響。\n畫面偏黃→調大\n畫面偏藍→調小\n也可以用下方「自動白平衡」。',
+    'method': '方法B（Top-hat，建議）：找「比周圍亮」的小亮點，整體亮度變化時也穩定。\n方法A（二值化）：亮度高於固定門檻就算，光線很穩定時才適合。\n下方只列出目前方法用得到的參數。',
+    'sigma': '方法B的靈敏度：亮點要比背景亮多少才算。\n數字越小越敏感。\n雜訊、紋路被圈起來→調大\n水滴沒被圈到→調小',
+    'kernel': '方法B的範圍大小（原圖像素）。比它小的亮點才會被找出來。\n約設成水滴直徑的2倍。\n大水滴只圈到一部分或漏抓→調大\n反光、大片亮區被圈→調小（數字越大也越慢）',
+    'thresh': '方法A的亮度門檻（0～255），比它亮的地方算水滴。\n背景也被圈起來→調大\n水滴沒被圈到→調小',
+    'min_area': '亮點面積小於此值（原圖像素）就忽略。\n很多細小雜訊點被圈→調大\n小水滴被漏掉→調小',
+    'max_area': '亮點面積大於此值（原圖像素）就忽略，用來排除反光、燈影等大片亮區。\n大水滴被漏掉→調大\n大片反光被圈→調小',
+    'scale': '偵測前先把影像縮小的比例，1.0為原尺寸。\n上方「偵測ms」太大→調小（較快）\n小水滴縮小後消失→調大（較準、較慢）\n面積與範圍大小會自動換算，不用跟著改。',
+    'wet_count': '畫面中水滴數超過此值就判定WET。\n沒水卻常跳WET→調大\n有水卻一直DRY→調小',
+    'hist_thresh': '和上一張比，畫面亮度分佈的變化量超過此值也判定WET（抓整片水漬、積水這類突然變化）。\n燈光閃爍、有人走過就誤判→調大\n大片水漬出現卻沒反應→調小',
+    'wet_frames': '要連續幾張都符合，才在DRY/WET之間切換，避免狀態閃爍。\n狀態跳來跳去→調大\n反應太慢→調小\n延遲秒數約=張數÷幀率',
+}
+METHOD_ONLY = {'sigma': 'B', 'kernel': 'B', 'thresh': 'A'}     # 只有該偵測方法才用到的參數
 ROW_THRESH_RATIO = 1.3
 ROI_PADDING = 30
 ROI_COLORS = [(0, 220, 255), (255, 120, 0), (180, 0, 255), (0, 255, 120), (255, 0, 160)]
@@ -151,11 +181,15 @@ def chi2_dist(h1, h2):
     return float(np.sum((h1 - h2) ** 2 / (h1 + h2 + 1e-10)) / 2)
 
 
+def to_ppm(img_bgr, w, h):
+    """BGR 影像縮放後轉成 PPM 位元組（不碰 Tk，可在背景執行緒做）。"""
+    small = cv2.cvtColor(cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+    return f'P6 {w} {h} 255 '.encode() + small.tobytes()
+
+
 def to_photo(img_bgr, w, h):
     """BGR 影像縮放後轉成 Tk PhotoImage（用 PPM，不需要 PIL）。"""
-    small = cv2.cvtColor(cv2.resize(img_bgr, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
-    return tk.PhotoImage(width=w, height=h, data=f'P6 {w} {h} 255 '.encode() + small.tobytes(),
-                         format='PPM')
+    return tk.PhotoImage(width=w, height=h, data=to_ppm(img_bgr, w, h), format='PPM')
 
 
 def fmt_duration(sec):
@@ -176,6 +210,7 @@ class Grabber(threading.Thread):
         self.pixel_format = camera.get_pixel_format_as_string()
         self.lock = threading.Lock()
         self.latest = None          # (data, w, h, 序號)
+        self.new_frame = threading.Event()
         self.seq = 0
         self.n_bad = 0
         self.times = []
@@ -207,6 +242,7 @@ class Grabber(threading.Thread):
                     self.seq += 1
                     self.latest = (data, w, h, self.seq)
                     self.times = (self.times + [time.perf_counter()])[-20:]
+                self.new_frame.set()
         finally:
             self.camera.stop_acquisition()
 
@@ -235,6 +271,7 @@ class Session:
         self.records = []           # (經過秒數, 水滴數, wet, chi2)
         self.events = []            # dict: id, start, end, max_drops, image(記憶體), file
         self._open = None
+        self.loaded = False         # True：從硬碟讀回的舊紀錄
 
     @property
     def running(self):
@@ -293,18 +330,108 @@ class Session:
         }
 
     def export(self):
-        """寫出 frames.csv 與 report.html，回傳 report.html 路徑。"""
+        """寫出 frames.csv、session.json 與 report.html，回傳 report.html 路徑。"""
         if self._open is not None:
             self._write_snapshot(self._open)     # 進行中的事件先存一張目前的截圖
-        with open(self.dir / 'frames.csv', 'w', newline='', encoding='utf-8-sig') as f:
-            w = csv.writer(f)
-            w.writerow(['elapsed_s', 'time', 'drops', 'wet', 'hist_chi2'])
-            for t, n, wet, d in self.records:
-                ts = datetime.fromtimestamp(self.start.timestamp() + t).strftime('%H:%M:%S.%f')[:-3]
-                w.writerow([f'{t:.3f}', ts, n, int(wet), f'{d:.4f}'])
+        if not self.loaded:
+            with open(self.dir / 'frames.csv', 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(['elapsed_s', 'time', 'drops', 'wet', 'hist_chi2'])
+                for t, n, wet, d in self.records:
+                    ts = datetime.fromtimestamp(self.start.timestamp() + t).strftime('%H:%M:%S.%f')[:-3]
+                    w.writerow([f'{t:.3f}', ts, n, int(wet), f'{d:.4f}'])
+        meta = {'start': self.start.isoformat(), 'end': self.end.isoformat() if self.end else None,
+                'params': self.params, 'rois': [list(r) for r in self.rois],
+                'events': [{k: ev[k] for k in ('id', 'start', 'end', 'max_drops', 'file')} for ev in self.events]}
+        (self.dir / 'session.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
         path = self.dir / 'report.html'
         path.write_text(render_html(self), encoding='utf-8')
         return path
+
+
+    @classmethod
+    def load(cls, folder):
+        """從 output/sessions/<開始時間>/ 讀回一次監測（報表頁看舊紀錄用）。"""
+        s = cls.__new__(cls)
+        s.dir, s._open, s.loaded = folder, None, True
+        s.records, first_time = [], None
+        with open(folder / 'frames.csv', newline='', encoding='utf-8-sig') as f:
+            for row in csv.DictReader(f):
+                first_time = first_time or row['time']
+                s.records.append((float(row['elapsed_s']), int(row['drops']), row['wet'] == '1',
+                                  float(row['hist_chi2'])))
+        try:
+            meta = json.loads((folder / 'session.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            meta = None
+        if meta:
+            s.start = datetime.fromisoformat(meta['start'])
+            s.end = datetime.fromisoformat(meta['end']) if meta.get('end') else None
+            s.params, s.rois = meta['params'], [tuple(r) for r in meta['rois']]
+            s.events = [dict(ev, image=None) for ev in meta['events']]
+        else:
+            # 舊版沒有 session.json：時間由資料夾名稱 + 第一筆紀錄推回，事件由 wet 欄位重建
+            s.start = _legacy_start(folder.name, first_time, s.records)
+            s.end = None
+            s.params, s.rois = _legacy_params(folder / 'report.html')
+            s.events = _rebuild_events(s.records, folder)
+        if s.end is None:           # 監測中途匯出或程式中斷：以最後一筆紀錄當結束時間
+            s.end = datetime.fromtimestamp(s.start.timestamp() + (s.records[-1][0] if s.records else 0))
+        for ev in s.events:         # 截圖用 1/2 解碼，報表縮圖夠用又省記憶體
+            if ev['file'] and (folder / ev['file']).exists():
+                ev['image'] = cv2.imread(str(folder / ev['file']), cv2.IMREAD_REDUCED_COLOR_2)
+        return s
+
+
+def _legacy_start(name, first_time, records):
+    start = datetime.strptime(name, '%Y%m%d_%H%M%S')
+    if not first_time:
+        return start
+    t = datetime.combine(start.date(), datetime.strptime(first_time, '%H:%M:%S.%f').time())
+    if (start - t).total_seconds() > 3600:      # 第一筆紀錄跨過午夜
+        t += timedelta(days=1)
+    return datetime.fromtimestamp(t.timestamp() - records[0][0])
+
+
+def _legacy_params(report_file):
+    """從舊版 report.html 的「偵測參數」表格讀回參數。"""
+    labels = {label: (key, digits) for group in PARAM_GROUPS.values() for key, label, *_, digits in group}
+    params, rois = {}, []
+    try:
+        text = report_file.read_text(encoding='utf-8')
+    except OSError:
+        return params, rois
+    for k, v in re.findall(r'<tr><th>(.*?)</th><td>(.*?)</td></tr>', text):
+        k, v = html.unescape(k), html.unescape(v)
+        if k == '偵測方法':
+            params['method'] = 'B' if v.startswith('B') else 'A'
+        elif k == 'ROI':
+            rois = [tuple(map(int, m)) for m in re.findall(r'\((\d+), (\d+), (\d+), (\d+)\)', v)]
+        elif k in labels:
+            key, digits = labels[k]
+            try:
+                params[key] = int(float(v)) if digits == 0 else float(v)
+            except ValueError:
+                pass
+    return params, rois
+
+
+def _rebuild_events(records, folder):
+    """依 Session.add 的規則，從每張影像的 wet 欄位重建 WET 事件。"""
+    events, ev = [], None
+    for t, n, wet, _ in records:
+        if wet and ev is None:
+            ev = {'id': len(events) + 1, 'start': t, 'end': t, 'max_drops': -1, 'image': None, 'file': None}
+            events.append(ev)
+        if ev is not None:
+            ev['end'], ev['max_drops'] = t, max(ev['max_drops'], n)
+            if not wet:
+                ev = None
+    for ev in events:
+        f = f"events/event_{ev['id']:03d}.jpg"
+        if (folder / f).exists():
+            ev['file'] = f
+    return events
 
 
 # ─────────── HTML 報表 ───────────
@@ -314,7 +441,7 @@ def chart_svg(session, width=1000, height=280):
     pad_l, pad_r, pad_t, pad_b = 48, 16, 14, 34
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
     dur = max(session.elapsed(), 1e-6)
-    thresh = session.params.get('wet_count', 30)
+    thresh = session.params.get('wet_count', DETECT_DEFAULTS['wet_count'])
     ymax = max([r[1] for r in recs] + [thresh]) * 1.1 or 1
     x = lambda t: pad_l + t / dur * pw
     y = lambda v: pad_t + ph - v / ymax * ph
@@ -345,7 +472,7 @@ def chart_svg(session, width=1000, height=280):
 def param_lines(params, rois):
     lines = [('偵測方法', 'B：Top-hat' if params.get('method') == 'B' else 'A：二值化')]
     for group in PARAM_GROUPS.values():
-        lines += [(label, params.get(key)) for key, label, *_ in group]
+        lines += [(label, params.get(key, '—')) for key, label, *_ in group]
     lines.append(('ROI', ', '.join(str(tuple(r)) for r in rois) or '自動'))
     return lines
 
@@ -419,6 +546,8 @@ class LiveDropApp:
         self.specs = {spec[0]: spec for group in PARAM_GROUPS.values() for spec in group}
         self.history = []           # 復原用：每次變更前的參數快照
         self._commit_job = None
+        self._shown_method = None   # 偵測分頁目前列出哪個方法的參數
+        self._help_job = None       # 畫面上說明框的自動關閉計時
 
         self.rois = []              # 手動 ROI（原圖座標）
         self._drag = None
@@ -434,16 +563,31 @@ class LiveDropApp:
         self.proc_ms = 0.0
         self.view_scale = 1.0
         self.view_offset = (0, 0)
+        self.view_size = (VIEW_W, VIEW_H)   # 畫布目前大小（由 <Configure> 更新，背景執行緒讀）
+        self._photos = []           # 即時畫面各橫帶的 PhotoImage
+        self._view_key = None       # (寬, 高, 位移)：改變時才重建 PhotoImage
+        self._strip_job = None
+        self._pending_strips = None
         self.session = None
         self.page = 'live'
         self.group = '相機'
+        self.report_dir = None      # 報表頁正在看的紀錄資料夾（None：最新一筆）
+        self._loaded = {}           # 已讀回的舊紀錄快取
+
+        # 偵測在背景執行緒做，主執行緒只貼圖，觸控操作才不會卡
+        self.lock = threading.Lock()    # 保護 session（背景寫紀錄 vs 主執行緒停止 / 匯出 / 畫報表）
+        self.result = None          # (原圖, 偵測畫面, 水滴數, chi2, 顯示用影像, 序號)
+        self.running = True
+        self.worker = threading.Thread(target=self._process_loop, daemon=True)
 
         self._build_ui()
         self._load_settings()
         if fullscreen:
             self.toggle_fullscreen()
         self.grabber.start()
+        self.worker.start()
         self.root.protocol('WM_DELETE_WINDOW', self.close)
+        self.root.bind('<Configure>', self._on_root_resize)
         self.root.after(30, self._tick)
 
     # ── 相機 ──
@@ -516,15 +660,17 @@ class LiveDropApp:
 
     def _build_live_page(self):
         page = self.live_page = tk.Frame(self.body, bg=C_BG)
+        # 右側面板先 pack 固定寬度，畫布再填滿剩下空間（全螢幕時跟著放大）
+        panel = tk.Frame(page, bg=C_PANEL, width=PANEL_W)
+        panel.pack(side='right', fill='y', pady=6, padx=(0, 6))
+        panel.pack_propagate(False)
+
         self.canvas = tk.Canvas(page, width=VIEW_W, height=VIEW_H, bg='black', highlightthickness=0)
-        self.canvas.pack(side='left', padx=6, pady=6)
+        self.canvas.pack(side='left', fill='both', expand=True, padx=6, pady=6)
         self.canvas.bind('<ButtonPress-1>', self._on_press)
         self.canvas.bind('<B1-Motion>', self._on_drag)
         self.canvas.bind('<ButtonRelease-1>', self._on_release)
-
-        panel = tk.Frame(page, bg=C_PANEL, width=PANEL_W)
-        panel.pack(side='left', fill='y', pady=6)
-        panel.pack_propagate(False)
+        self.canvas.bind('<Configure>', self._on_canvas_resize)
 
         # 分頁按鈕
         tabs = tk.Frame(panel, bg=C_PANEL)
@@ -572,11 +718,15 @@ class LiveDropApp:
             row.pack(fill='x', pady=(0, 4))
             self.method_btns = {}
             for val, text in (('B', '方法 B  Top-hat'), ('A', '方法 A  二值化')):
-                b = self._btn(row, text, lambda v=val: self._set_param('method', v), size=14)
+                b = self._btn(row, text, lambda v=val: (self._set_param('method', v), self._show_help('method')),
+                              size=14)
                 b.pack(side='left', expand=True, fill='x', padx=2, ipady=10)
                 self.method_btns[val] = b
+            self._shown_method = self.params['method']
             self._refresh_method()
         for key, label, lo, hi, step, digits in PARAM_GROUPS[name]:
+            if METHOD_ONLY.get(key, self.params['method']) != self.params['method']:
+                continue
             row = tk.Frame(f, bg=C_CARD)
             row.pack(fill='x', pady=3)
             self._btn(row, '＋', lambda k=key: self._step(k, +1), bg=C_BTN, size=24, width=3,
@@ -589,15 +739,56 @@ class LiveDropApp:
             v = tk.Label(left, text='', bg=C_CARD, fg=C_TEXT, font=(FONT, 20, 'bold'), anchor='w')
             v.pack(fill='x')
             self.value_lbls[key] = v
+            for w in (row, left, *left.winfo_children()):      # 點參數名稱看說明
+                w.bind('<ButtonPress-1>', lambda e, k=key: self._show_help(k))
         if name == '相機':
             self._btn(f, '自動白平衡（畫面中央放白紙）', self.auto_wb, size=14).pack(fill='x', pady=6, ipady=10)
+        # 說明區：填滿面板剩下的空白
+        self.help_lbl = tk.Label(f, text='', bg=C_PANEL, fg=C_TEXT, font=(FONT, 13), justify='left', anchor='nw',
+                                 wraplength=PANEL_W - 40)
+        self.help_lbl.pack(fill='both', expand=True, pady=(10, 0))
+        self._show_help(None)
         self._refresh_values()
+
+    def _show_help(self, key):
+        if key is None:
+            text = GROUP_HELP[self.group]
+        else:
+            name = '偵測方法' if key == 'method' else self.specs[key][1]
+            text = f'【{name}】\n{PARAM_HELP[key]}'
+        self.hide_help_overlay()
+        self.help_lbl.config(text=text)
+        self.root.update_idletasks()
+        if key is not None and self.help_lbl.winfo_reqheight() > self.help_lbl.winfo_height():
+            # 面板空白不夠（例如 1280×800）：改浮在左邊畫面上
+            self.help_lbl.config(text=f'【{name}】說明顯示在左邊畫面')
+            self._show_help_overlay(text)
+
+    def _show_help_overlay(self, text):
+        c = self.canvas
+        t = c.create_text(28, 28, text=text + '\n\n（點此關閉）', anchor='nw', fill=C_TEXT,
+                          font=(FONT, 16), width=min(520, c.winfo_width() - 60), tags='help')
+        x1, y1, x2, y2 = c.bbox(t)
+        c.create_rectangle(x1 - 16, y1 - 16, x2 + 16, y2 + 16, fill=C_PANEL, outline=C_ACCENT, width=2,
+                           tags='help')
+        c.tag_raise(t)
+        self._help_job = self.root.after(20000, self.hide_help_overlay)
+
+    def hide_help_overlay(self):
+        self.canvas.delete('help')
+        if self._help_job is not None:
+            self.root.after_cancel(self._help_job)
+            self._help_job = None
 
     def _refresh_values(self):
         for key, lbl in self.value_lbls.items():
             lbl.config(text=f'{self.params[key]:.{self.specs[key][5]}f}')
 
     def _refresh_method(self):
+        if self.group == '偵測' and self._shown_method != self.params['method']:
+            self._show_group('偵測')        # 方法改變：換成新方法的參數列
+            self._show_help('method')
+            return
         if self.group == '偵測':
             for v, b in self.method_btns.items():
                 c = C_ACCENT if self.params['method'] == v else C_BTN
@@ -613,6 +804,7 @@ class LiveDropApp:
             v = v + direction * step
         v = round(min(max(v, lo), hi), digits)
         self._set_param(key, int(v) if digits == 0 else v)
+        self._show_help(key)
 
     def _set_param(self, key, value):
         if self.params[key] == value:
@@ -693,6 +885,10 @@ class LiveDropApp:
         return int((x - self.view_offset[0]) / s), int((y - self.view_offset[1]) / s)
 
     def _on_press(self, e):
+        if 'help' in self.canvas.gettags('current'):
+            self.hide_help_overlay()
+            self._drag = None
+            return
         self._drag = (e.x, e.y)
 
     def _on_drag(self, e):
@@ -731,15 +927,21 @@ class LiveDropApp:
 
     # ── 監測 / 頁面 ──
     def toggle_monitor(self):
-        if self.session and self.session.running:
-            self.session.stop()
-            self.session.export()
-            self.mon_btn.config(text='開始監測', bg=C_GREEN, activebackground=C_GREEN)
-            if self.page == 'report':
-                self._render_report()
-        else:
-            self.session = Session(self.params, self.rois)
+        with self.lock:
+            if self.session and self.session.running:
+                self.session.stop()
+                self.session.export()
+                started = False
+            else:
+                self.session = Session(self.params, self.rois)
+                started = True
+        if started:
             self.mon_btn.config(text='停止監測', bg=C_RED, activebackground=C_RED)
+        else:
+            self.mon_btn.config(text='開始監測', bg=C_GREEN, activebackground=C_GREEN)
+        if self.page == 'report':
+            self.report_dir = None
+            self._render_report()
 
     def toggle_page(self):
         if self.page == 'live':
@@ -747,6 +949,7 @@ class LiveDropApp:
             self.live_page.pack_forget()
             self.report_page.pack(fill='both', expand=True)
             self.page_btn.config(text='即時')
+            self.report_dir = None
             self._render_report()
         else:
             self.page = 'live'
@@ -758,6 +961,27 @@ class LiveDropApp:
         fs = not bool(self.root.attributes('-fullscreen'))
         self.root.attributes('-fullscreen', fs)
         self.fs_btn.config(text='視窗' if fs else '全螢幕')
+        if self.page == 'report':  # 等視窗尺寸更新後再依新寬度重畫報表
+            self.root.after(200, self._render_report)
+
+    def _on_root_resize(self, e):
+        # labwc + Xwayland：視窗放大後被搬移的子元件（右側面板按鈕）內容會變黑，又不會收到 Expose，
+        # 要等別的事件才重畫。尺寸穩定後對所有元件送一次 Expose 強制重繪。
+        if e.widget is not self.root or (e.width, e.height) == getattr(self, '_root_size', None):
+            return
+        self._root_size = (e.width, e.height)
+        if getattr(self, '_expose_job', None):
+            self.root.after_cancel(self._expose_job)
+        self._expose_job = self.root.after(150, self._force_redraw)
+
+    def _force_redraw(self):
+        self._expose_job = None
+        stack = [self.root]
+        while stack:
+            w = stack.pop()
+            stack.extend(w.winfo_children())
+            if w is not self.root and w.winfo_ismapped():
+                w.event_generate('<Expose>')
 
     def toggle_pause(self):
         self.paused = not self.paused
@@ -768,6 +992,10 @@ class LiveDropApp:
         page = self.report_page = tk.Frame(self.body, bg=C_BG)
         bar = tk.Frame(page, bg=C_BG)
         bar.pack(fill='x', padx=8, pady=(8, 6))
+        self.older_btn = self._btn(bar, '◀ 較舊', lambda: self._report_nav(+1))
+        self.older_btn.pack(side='left', padx=(0, 4), ipady=12, ipadx=10)
+        self.newer_btn = self._btn(bar, '較新 ▶', lambda: self._report_nav(-1))
+        self.newer_btn.pack(side='left', padx=(0, 12), ipady=12, ipadx=10)
         self.report_title = tk.Label(bar, text='', bg=C_BG, fg=C_TEXT, font=(FONT, 16, 'bold'), anchor='w')
         self.report_title.pack(side='left', fill='x', expand=True)
         self._btn(bar, '重新整理', self._render_report).pack(side='right', padx=4, ipady=12, ipadx=14)
@@ -783,19 +1011,59 @@ class LiveDropApp:
         self.rcanvas.bind('<Button-5>', lambda e: self.rcanvas.yview_scroll(3, 'units'))
         self._report_photos = []
 
+    def _report_dirs(self):
+        """所有監測紀錄資料夾（新到舊）；這次監測就算還沒匯出也列在最前面。"""
+        dirs = sorted((d for d in SESSIONS_DIR.glob('*') if (d / 'frames.csv').exists()), reverse=True)
+        if self.session and self.session.dir not in dirs:
+            dirs.insert(0, self.session.dir)
+        return dirs
+
+    def _report_session(self, folder):
+        if self.session and folder == self.session.dir:
+            return self.session
+        if folder not in self._loaded:
+            try:
+                self._loaded[folder] = Session.load(folder)
+            except (OSError, ValueError, KeyError, IndexError) as e:
+                print(f'[警告] 讀取紀錄 {folder.name} 失敗：{e}')
+                self._loaded[folder] = None
+        return self._loaded[folder]
+
+    def _report_nav(self, step):
+        dirs = self._report_dirs()
+        if self.report_dir in dirs:
+            i = min(max(dirs.index(self.report_dir) + step, 0), len(dirs) - 1)
+            self.report_dir = dirs[i]
+            self._render_report()
+
     def _render_report(self):
+        with self.lock:
+            self._render_report_locked()
+
+    def _render_report_locked(self):
         c = self.rcanvas
         c.delete('all')
         self._report_photos = []
-        s = self.session
-        W = WIN_W - 16
+        dirs = self._report_dirs()
+        if self.report_dir not in dirs:
+            self.report_dir = dirs[0] if dirs else None
+        idx = dirs.index(self.report_dir) if self.report_dir else 0
+        for b, ok in ((self.older_btn, idx < len(dirs) - 1), (self.newer_btn, idx > 0)):
+            b.config(state='normal' if ok else 'disabled', bg=C_CARD if ok else C_BG)
+        s = self._report_session(self.report_dir) if self.report_dir else None
+        W = max(self.rcanvas.winfo_width(), WIN_W - 16)
+        if s is None and self.report_dir:
+            self.report_title.config(text=f'紀錄 {idx + 1}/{len(dirs)}  {self.report_dir.name} 讀取失敗')
+            c.configure(scrollregion=(0, 0, W, 400))
+            return
         if s is None:
             self.report_title.config(text='尚無監測紀錄')
             c.create_text(W // 2, 180, text='按上方「開始監測」開始記錄，\n之後回到這頁就能預覽報表。',
                           fill=C_MUTED, font=(FONT, 20), justify='center')
             c.configure(scrollregion=(0, 0, W, 400))
             return
-        self.report_title.config(text=f'監測紀錄  {s.start:%Y-%m-%d %H:%M:%S}' + ('（監測中）' if s.running else ''))
+        self.report_title.config(text=f'紀錄 {idx + 1}/{len(dirs)}  {s.start:%Y-%m-%d %H:%M:%S}'
+                                      + ('（監測中）' if s.running else ''))
         y = 4
         # 統計卡片
         items = list(s.summary().items())
@@ -855,7 +1123,7 @@ class LiveDropApp:
         pl, pr, pt, pb = 56, 16, 14, 30
         pw, ph = w - pl - pr, h - pt - pb
         dur = max(s.elapsed(), 1e-6)
-        thresh = s.params['wet_count']
+        thresh = s.params.get('wet_count', DETECT_DEFAULTS['wet_count'])
         recs = s.records
         ymax = max([r[1] for r in recs] + [thresh]) * 1.1 or 1
         X = lambda t: x0 + pl + t / dur * pw
@@ -881,9 +1149,11 @@ class LiveDropApp:
                 c.create_line(*pts, fill='#38bdf8', width=2)
 
     def export_report(self):
-        if self.session is None:
+        s = self._report_session(self.report_dir) if self.report_dir else None
+        if s is None:
             return
-        path = self.session.export()
+        with self.lock:
+            path = s.export()
         self.report_title.config(text=f'已匯出：{path.relative_to(OUTPUT_DIR.parent)}')
         try:
             subprocess.Popen(['xdg-open', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -948,18 +1218,36 @@ class LiveDropApp:
         self.proc_ms = (time.perf_counter() - t0) * 1000
         return vis, n, d
 
+    def _process_loop(self):
+        """背景執行緒：解拜耳 → 偵測 → 寫紀錄 → 縮成畫布大小。OpenCV 運算時會釋放 GIL。"""
+        last = 0
+        while self.running:
+            if not self.grabber.new_frame.wait(0.5):
+                continue
+            self.grabber.new_frame.clear()
+            with self.grabber.lock:
+                latest = self.grabber.latest
+            if not latest or latest[3] == last or self.paused:
+                continue
+            data, w, h, last = latest
+            try:
+                frame = to_bgr(data, w, h, self.grabber.pixel_format)
+                vis, n, chi2 = self._detect(frame, dict(self.params))
+                with self.lock:
+                    if self.session and self.session.running:
+                        self.session.add(n, self.is_wet, chi2, vis)
+                view = self._fit_view(vis) if self.page == 'live' else None
+                self.result = (frame, vis, n, chi2, view, last)
+            except Exception as e:     # 單張失敗不要讓執行緒整個停掉
+                print(f'[警告] 處理影像失敗：{e!r}')
+
     def _tick(self):
-        with self.grabber.lock:
-            latest = self.grabber.latest
-        if latest and latest[3] != self.last_seq and not self.paused:
-            data, w, h, seq = latest
-            self.last_seq = seq
-            self.frame_bgr = to_bgr(data, w, h, self.grabber.pixel_format)
-            self.vis_bgr, self.n_drops, self.chi2 = self._detect(self.frame_bgr, self.params)
-            if self.session and self.session.running:
-                self.session.add(self.n_drops, self.is_wet, self.chi2, self.vis_bgr)
+        res = self.result
+        if res is not None and res[-1] != self.last_seq:
+            self.last_seq = res[-1]
+            self.frame_bgr, self.vis_bgr, self.n_drops, self.chi2, view = res[:5]
             if self.page == 'live':
-                self._show(self.vis_bgr)
+                self._put_view(view or self._fit_view(self.vis_bgr))
 
         color = C_RED if self.is_wet else C_GREEN
         self.status_lbl.config(text='WET' if self.is_wet else 'DRY', bg=color)
@@ -972,16 +1260,58 @@ class LiveDropApp:
                  + ('　【暫停】' if self.paused else '') + mon)
         self.root.after(30, self._tick)
 
-    def _show(self, img):
+    def _on_canvas_resize(self, e):
+        if e.width >= 10 and e.height >= 10:
+            self.view_size = (e.width, e.height)
+            if self.vis_bgr is not None:
+                self._put_view(self._fit_view(self.vis_bgr))
+
+    def _fit_view(self, img):
+        """依畫布大小等比例縮放置中，切成橫帶。回傳 (橫帶清單, 寬, 高, 縮放比例, 左上角位移)。不碰 Tk。"""
         h, w = img.shape[:2]
-        s = min(VIEW_W / w, VIEW_H / h)
+        cw, ch = self.view_size
+        s = min(cw / w, ch / h)
         vw, vh = int(w * s), int(h * s)
-        self.view_scale = s
-        self.view_offset = ((VIEW_W - vw) // 2, (VIEW_H - vh) // 2)
-        self._photo = to_photo(img, vw, vh)
-        self.canvas.delete('img')
-        self.canvas.create_image(*self.view_offset, anchor='nw', image=self._photo, tags='img')
-        self.canvas.tag_lower('img')
+        if ImageTk is None:
+            return [to_ppm(img, vw, vh)], vw, vh, s, ((cw - vw) // 2, (ch - vh) // 2)
+        rgb = cv2.cvtColor(cv2.resize(img, (vw, vh), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+        bounds = [vh * i // VIEW_STRIPS for i in range(VIEW_STRIPS + 1)]
+        strips = [Image.fromarray(rgb[y0:y1]) for y0, y1 in zip(bounds, bounds[1:])]
+        return strips, vw, vh, s, ((cw - vw) // 2, (ch - vh) // 2)
+
+    def _put_view(self, view):
+        strips, vw, vh, self.view_scale, self.view_offset = view
+        if ImageTk is None:
+            self._photos = [tk.PhotoImage(width=vw, height=vh, data=strips[0], format='PPM')]
+            self.canvas.delete('img')
+            self.canvas.create_image(*self.view_offset, anchor='nw', image=self._photos[0], tags='img')
+            self.canvas.tag_lower('img')
+            return
+        if self._view_key != (vw, vh, self.view_offset):
+            # 尺寸改變：重建每條橫帶的 PhotoImage 與畫布物件
+            self._view_key = (vw, vh, self.view_offset)
+            if self._strip_job is not None:
+                self.root.after_cancel(self._strip_job)
+                self._strip_job = None
+            self._photos = [ImageTk.PhotoImage(im) for im in strips]
+            self.canvas.delete('img')
+            y = self.view_offset[1]
+            for ph in self._photos:
+                self.canvas.create_image(self.view_offset[0], y, anchor='nw', image=ph, tags='img')
+                y += ph.height()
+            self.canvas.tag_lower('img')
+            return
+        self._pending_strips = strips   # 之後由 _paste_strip 每次貼一條
+        if self._strip_job is None:
+            self._paste_strip(0)
+
+    def _paste_strip(self, i):
+        strips = self._pending_strips
+        self._photos[i].paste(strips[i])
+        if i + 1 < len(strips):
+            self._strip_job = self.root.after(1, self._paste_strip, i + 1)
+        else:
+            self._strip_job = None
 
     def save(self):
         if self.frame_bgr is None:
@@ -994,6 +1324,8 @@ class LiveDropApp:
 
     def close(self):
         try:
+            self.running = False
+            self.worker.join(timeout=3)
             if self.session and self.session.running:
                 self.session.stop()
                 self.session.export()
