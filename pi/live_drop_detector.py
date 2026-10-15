@@ -83,6 +83,7 @@ DETECT_DEFAULTS = {
     'kernel': 61,           # 方法 B：Top-hat 核大小（原圖像素）
     'min_area': 5,          # 原圖像素
     'max_area': 3000,
+    'split': 15,            # 相連水滴的最小中心距離（原圖像素），0 = 不分開
     'scale': 0.5,           # 偵測前縮小比例（Pi 上全幅 Top-hat 太慢）
     'wet_count': 30,        # 水滴數超過即判定 WET
     'hist_thresh': 0.25,    # 直方圖 chi2 變化超過即判定 WET
@@ -92,7 +93,7 @@ DETECT_DEFAULTS = {
 # 參數面板：(key, 名稱, 下限, 上限, 步進, 小數位)；步進為 None 表示乘法調整
 PARAM_GROUPS = {
     '相機': [
-        ('exposure_ms', '曝光 (ms)', 0.1, 100.0, None, 1),
+        ('exposure_ms', '曝光 (ms)', 0.015, 100.0, None, 3),     # 相機下限 14 µs
         ('gain', '增益 (dB)', 0.0, 24.0, 0.5, 1),
         ('fps', '幀率 (fps)', 1.0, 18.5, 1.0, 1),
         ('wb_red', '白平衡 紅', 256, 4095, 50, 0),
@@ -101,9 +102,10 @@ PARAM_GROUPS = {
     '偵測': [
         ('sigma', 'B：門檻 sigma', 0.5, 6.0, 0.1, 1),
         ('kernel', 'B：Top-hat 核大小', 3, 301, 2, 0),
-        ('thresh', 'A：二值化門檻', 0, 255, 5, 0),
+        ('thresh', 'A：二值化門檻', 0, 255, 1, 0),
         ('min_area', '最小面積 (px)', 1, 500, 1, 0),
         ('max_area', '最大面積 (px)', 100, 50000, 100, 0),
+        ('split', '分開相連水滴 (px)', 0, 200, 1, 0),
         ('scale', '偵測縮放比例', 0.25, 1.0, 0.05, 2),
     ],
     '判定': [
@@ -127,15 +129,20 @@ PARAM_HELP = {
     'method': '方法B（Top-hat，建議）：找「比周圍亮」的小亮點，整體亮度變化時也穩定。\n方法A（二值化）：亮度高於固定門檻就算，光線很穩定時才適合。\n下方只列出目前方法用得到的參數。',
     'sigma': '方法B的靈敏度：亮點要比背景亮多少才算。\n數字越小越敏感。\n雜訊、紋路被圈起來→調大\n水滴沒被圈到→調小',
     'kernel': '方法B的範圍大小（原圖像素）。比它小的亮點才會被找出來。\n約設成水滴直徑的2倍。\n大水滴只圈到一部分或漏抓→調大\n反光、大片亮區被圈→調小（數字越大也越慢）',
-    'thresh': '方法A的亮度門檻（0～255），比它亮的地方算水滴。\n背景也被圈起來→調大\n水滴沒被圈到→調小',
+    'thresh': '方法A的亮度門檻（0～255），比它亮的地方算水滴。\n背景也被圈起來→調大\n水滴沒被圈到→調小\n點一下±1，按住±5，按久一點±10。\n按「二值化」可在畫面右下看直方圖與門檻線。',
     'min_area': '亮點面積小於此值（原圖像素）就忽略。\n很多細小雜訊點被圈→調大\n小水滴被漏掉→調小',
     'max_area': '亮點面積大於此值（原圖像素）就忽略，用來排除反光、燈影等大片亮區。\n大水滴被漏掉→調大\n大片反光被圈→調小',
+    'split': '靠在一起、連成一塊的水滴，從中間細腰處切開分別計算。\n數值約設成單顆水滴的直徑（原圖像素），兩顆中心距離不到此值的一半就當成同一顆。\n好幾顆只圈成一個→調小\n一顆水滴被切成好幾個圈→調大\n0 = 不分開（相連的一律算一顆）',
     'scale': '偵測前先把影像縮小的比例，1.0為原尺寸。\n上方「偵測ms」太大→調小（較快）\n小水滴縮小後消失→調大（較準、較慢）\n面積與範圍大小會自動換算，不用跟著改。',
     'wet_count': '畫面中水滴數超過此值就判定WET。\n沒水卻常跳WET→調大\n有水卻一直DRY→調小',
     'hist_thresh': '和上一張比，畫面亮度分佈的變化量超過此值也判定WET（抓整片水漬、積水這類突然變化）。\n燈光閃爍、有人走過就誤判→調大\n大片水漬出現卻沒反應→調小',
     'bayer': '感測器的紅綠藍排列方式，選錯整張畫面會偏綠或偏藍，偵測也會受影響。\n自動：依相機型號選（JHEM600GC→GB8、JHEM131GC→BG8）\n換了相機、紅色東西拍起來變綠→改選另一個\n選擇會記住，下次開啟沿用。',
     'wet_frames': '要連續幾張都符合，才在DRY/WET之間切換，避免狀態閃爍。\n狀態跳來跳去→調大\n反應太慢→調小\n延遲秒數約=張數÷幀率',
 }
+# 長按加速：點一下 ×1，按住 ×5，按住超過 HOLD_FAST_SEC 秒 ×10
+ACCEL_KEYS = {'thresh'}
+HOLD_FAST_SEC = 1.5
+ACCEL_REPEAT_MS = 250       # 加速參數的連發間隔（比一般慢，才看得清楚數字變化）
 METHOD_ONLY = {'sigma': 'B', 'kernel': 'B', 'thresh': 'A'}     # 只有該偵測方法才用到的參數
 ROW_THRESH_RATIO = 1.3
 ROI_PADDING = 30
@@ -181,10 +188,83 @@ def detect_method_b(roi_gray, sigma, kernel_size):
     return cv2.morphologyEx(binary, cv2.MORPH_OPEN, ke)
 
 
-def find_blobs(binary, min_area, max_area):
-    n, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    return [(centroids[i][0], centroids[i][1], stats[i, cv2.CC_STAT_AREA])
-            for i in range(1, n) if min_area <= stats[i, cv2.CC_STAT_AREA] <= max_area]
+def split_touching(binary, min_dist):
+    """把相連的水滴切開：距離轉換的局部高點當水滴中心，亮塊裡每個像素分給同一塊裡最近的中心。
+    均勻寬度的反光線，高點連成一條脊線只算一個中心，不會被切碎。回傳 [(cx, cy, 面積)]。"""
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    blobs = [(centroids[i][0], centroids[i][1], stats[i, cv2.CC_STAT_AREA]) for i in range(1, n)]
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    k = max(3, int(min_dist) | 1)
+    # 容許 1 px 起伏：斜線的脊線高度有鋸齒，不容許的話整條線會被切成好幾段
+    peaks = (dist >= cv2.dilate(dist, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))) - 1) & (dist >= 1)
+    n_pk, pk_labels = cv2.connectedComponents(peaks.astype(np.uint8), connectivity=8)
+    if n_pk <= 2:
+        return blobs
+    # 每個中心屬於哪一塊；只處理有 2 個以上中心的亮塊
+    owner = np.zeros(n_pk, np.int32)
+    ys, xs = np.nonzero(pk_labels)
+    owner[pk_labels[ys, xs]] = labels[ys, xs]
+    counts = np.bincount(owner[1:], minlength=n)
+    out = []
+    for i in range(1, n):
+        if counts[i] < 2:
+            out.append(blobs[i - 1])
+            continue
+        x, y, w, h = stats[i, :4]
+        mask = labels[y:y + h, x:x + w] == i
+        centers = np.isin(pk_labels[y:y + h, x:x + w], np.nonzero(owner == i)[0]) & mask
+        # 以中心為 0 做距離轉換，順便取得每個像素最近的中心編號
+        _, near = cv2.distanceTransformWithLabels((~centers).astype(np.uint8), cv2.DIST_L2, 5,
+                                                  labelType=cv2.DIST_LABEL_CCOMP)
+        near = near[mask]
+        py, px = np.nonzero(mask)
+        area = np.bincount(near)
+        sx, sy = np.bincount(near, px), np.bincount(near, py)
+        for j in np.nonzero(area)[0]:
+            out.append((x + sx[j] / area[j], y + sy[j] / area[j], int(area[j])))
+    return out
+
+
+def find_blobs(binary, min_area, max_area, split=0):
+    if split > 0:
+        blobs = split_touching(binary, split)
+    else:
+        n, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        blobs = [(centroids[i][0], centroids[i][1], stats[i, cv2.CC_STAT_AREA]) for i in range(1, n)]
+    return [b for b in blobs if min_area <= b[2] <= max_area]
+
+
+def draw_histogram(vis, hist, thresh):
+    """在畫面右下角畫亮度直方圖（對數刻度，像相機的直方圖），thresh 不為 None 時畫門檻線。"""
+    H, W = vis.shape[:2]
+    pw, ph = W * 2 // 5, H // 4
+    m = W // 64
+    x0, y0 = W - pw - m, H - ph - H // 12      # 底部留給狀態文字
+    box = vis[y0:y0 + ph, x0:x0 + pw]
+    box[:] = (box * 0.25).astype(np.uint8) + np.array([40, 30, 25], np.uint8)     # 半透明深色底
+    pad, top = pw // 30, ph // 6
+    gx0, gx1, gy1 = x0 + pad, x0 + pw - pad, y0 + ph - pad
+    gh = gy1 - (y0 + top)
+    v = np.log1p(hist.astype(np.float64))
+    v = v / v.max() if v.max() > 0 else v
+    xs = gx0 + np.arange(257) * (gx1 - gx0) / 256
+    lw = max(1, W // 640)
+    for i in range(256):
+        if v[i] <= 0:
+            continue
+        color = (60, 200, 255) if thresh is not None and i > thresh else (210, 210, 210)
+        cv2.rectangle(vis, (int(xs[i]), int(gy1 - v[i] * gh)), (max(int(xs[i + 1]) - 1, int(xs[i])), gy1), color, -1)
+    cv2.line(vis, (gx0, gy1), (gx1, gy1), (120, 120, 120), lw)
+    fs = W / 1400
+    if thresh is not None:
+        tx = int(gx0 + (thresh + 0.5) * (gx1 - gx0) / 256)
+        cv2.line(vis, (tx, y0 + top - pad // 2), (tx, gy1), (60, 60, 255), lw * 2)
+        total = hist.sum()
+        pct = hist[int(thresh) + 1:].sum() / total * 100 if total else 0
+        label = f'thresh {int(thresh)}   white {pct:.2f}%'
+    else:
+        label = 'method B: threshold is automatic'
+    cv2.putText(vis, label, (gx0, y0 + top - pad), cv2.FONT_HERSHEY_SIMPLEX, fs, (235, 235, 235), lw, cv2.LINE_AA)
 
 
 def gray_hist(gray):
@@ -622,6 +702,8 @@ class LiveDropApp:
         self.specs = {spec[0]: spec for group in PARAM_GROUPS.values() for spec in group}
         self.history = []           # 復原用：每次變更前的參數快照
         self._commit_job = None
+        self._hold_key = None       # 正在長按的參數（加速用）
+        self._hold_start = 0.0
         self._shown_method = None   # 偵測分頁目前列出哪個方法的參數
         self._help_job = None       # 畫面上說明框的自動關閉計時
 
@@ -630,6 +712,8 @@ class LiveDropApp:
         self.rois = []              # 手動 ROI（原圖座標）
         self._drag = None
         self.paused = False
+        self.show_binary = False    # 即時畫面改顯示二值化結果
+        self._last_det = None       # 最近一次偵測的 (二值圖, ROI, 水滴, 縮放, 數量, 原圖大小)，暫停時切換顯示用
         self.prev_hist = None
         self.last_seq = 0
         self.frame_bgr = None
@@ -743,6 +827,8 @@ class LiveDropApp:
         self.fs_btn.pack(side='right', fill='y', padx=4, pady=8)
         self.page_btn = self._btn(top, '報表', self.toggle_page, bg=C_PURPLE, size=18, width=5)
         self.page_btn.pack(side='right', fill='y', padx=4, pady=8)
+        self.bin_btn = self._btn(top, '二值化', self.toggle_binary, bg=C_BTN, size=18, width=5)
+        self.bin_btn.pack(side='right', fill='y', padx=4, pady=8)
         self.mon_btn = self._btn(top, '開始監測', self.toggle_monitor, bg=C_GREEN, size=18, width=7)
         self.mon_btn.pack(side='right', fill='y', padx=4, pady=8)
 
@@ -823,10 +909,12 @@ class LiveDropApp:
                 continue
             row = tk.Frame(f, bg=C_CARD)
             row.pack(fill='x', pady=3)
-            self._btn(row, '＋', lambda k=key: self._step(k, +1), bg=C_BTN, size=24, width=3,
-                      repeat=True).pack(side='right', fill='y', padx=(3, 4), pady=4)
-            self._btn(row, '－', lambda k=key: self._step(k, -1), bg=C_BTN, size=24, width=3,
-                      repeat=True).pack(side='right', fill='y', padx=3, pady=4)
+            kw = {'repeatinterval': ACCEL_REPEAT_MS} if key in ACCEL_KEYS else {}
+            for text, d, padx in (('＋', +1, (3, 4)), ('－', -1, 3)):
+                b = self._btn(row, text, lambda k=key, d=d: self._step(k, d), bg=C_BTN, size=24, width=3,
+                              repeat=True, **kw)
+                b.pack(side='right', fill='y', padx=padx, pady=4)
+                b.bind('<ButtonRelease-1>', self._end_hold, add='+')
             left = tk.Frame(row, bg=C_CARD)
             left.pack(side='left', fill='x', expand=True, padx=10, pady=2)
             tk.Label(left, text=label, bg=C_CARD, fg=C_MUTED, font=(FONT, 12), anchor='w').pack(fill='x')
@@ -888,7 +976,9 @@ class LiveDropApp:
 
     def _refresh_values(self):
         for key, lbl in self.value_lbls.items():
-            lbl.config(text=f'{self.params[key]:.{self.specs[key][5]}f}')
+            _, _, _, _, step, digits = self.specs[key]
+            v = self.params[key]
+            lbl.config(text=f'{v:.3g}' if step is None else f'{v:.{digits}f}')
 
     def _refresh_method(self):
         if self.group == '偵測' and self._shown_method != self.params['method']:
@@ -901,14 +991,25 @@ class LiveDropApp:
                 b.config(bg=c, activebackground=c)
 
     # ── 參數 / 復原 ──
+    def _end_hold(self, _e=None):
+        self._hold_key = None
+
     def _step(self, key, direction):
         _, _, lo, hi, step, digits = self.specs[key]
         v = self.params[key]
-        if step is None:            # 曝光：乘法調整，短曝光也能細調
-            v = v * 1.12 if direction > 0 else v / 1.12
+        if key in ACCEL_KEYS:       # 按鈕連發時越按越快：第一下 ×1，之後 ×5，再久 ×10
+            now = time.monotonic()
+            if self._hold_key != key:
+                self._hold_key, self._hold_start = key, now
+                mult = 1
+            else:
+                mult = 5 if now - self._hold_start < HOLD_FAST_SEC else 10
+            step = step * mult
+        if step is None:            # 曝光：乘法調整，取 3 位有效數字，短曝光也能細調
+            v = float(f'{(v * 1.12 if direction > 0 else v / 1.12):.3g}')
+            v = min(max(v, lo), hi)
         else:
-            v = v + direction * step
-        v = round(min(max(v, lo), hi), digits)
+            v = round(min(max(v + direction * step, lo), hi), digits)
         self._set_param(key, int(v) if digits == 0 else v)
         self._show_help(key)
 
@@ -1100,6 +1201,15 @@ class LiveDropApp:
             stack.extend(w.winfo_children())
             if w is not self.root and w.winfo_ismapped():
                 w.event_generate('<Expose>')
+
+    def toggle_binary(self):
+        self.show_binary = not self.show_binary
+        c = C_ACCENT if self.show_binary else C_BTN
+        self.bin_btn.config(text='看原圖' if self.show_binary else '二值化', bg=c, activebackground=c)
+        if self.paused and self.vis_bgr is not None and self.page == 'live':    # 暫停中也立刻換畫面
+            img = self._binary_view(self._last_det) if self.show_binary else self.vis_bgr
+            if img is not None:
+                self._put_view(self._fit_view(img))
 
     def toggle_pause(self):
         self.paused = not self.paused
@@ -1297,6 +1407,8 @@ class LiveDropApp:
         # 面積與核大小以原圖像素為準，縮小後換算
         min_a, max_a = max(1, p['min_area'] * s * s), p['max_area'] * s * s
         all_blobs = []
+        hist = np.zeros(256, np.float64)    # 二值化畫面的直方圖（ROI 內；每張都算，暫停時切換也有）
+        mask = np.zeros_like(gray)      # 各 ROI 的二值化結果拼回整張，給「二值化」畫面用
         for x1, y1, x2, y2 in rois:
             roi = gray[y1:y2, x1:x2]
             if roi.size == 0:
@@ -1306,7 +1418,11 @@ class LiveDropApp:
                 binary = detect_method_b(roi, p['sigma'], max(3, p['kernel'] * s))
             else:
                 binary = detect_method_a(roi, int(p['thresh']))
-            all_blobs.append(find_blobs(binary, min_a, max_a))
+            # 方法 A 門檻比的是模糊後的亮度，直方圖也用同一份
+            src = cv2.GaussianBlur(roi, (5, 5), 0) if p['method'] == 'A' else roi
+            hist += cv2.calcHist([src], [0], None, [256], [0, 256]).flatten()
+            mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], binary)
+            all_blobs.append(find_blobs(binary, min_a, max_a, p['split'] * s))
         n = sum(len(b) for b in all_blobs)
 
         x1, y1, x2, y2 = rois[0]
@@ -1324,8 +1440,28 @@ class LiveDropApp:
         else:
             self._streak = 0
 
-        vis = img.copy()
-        lw = max(2, img.shape[1] // 600)
+        thresh = int(p['thresh']) if p['method'] == 'A' else None
+        det = (mask, rois, all_blobs, s, n, img.shape[:2], hist, thresh)
+        self._last_det = det
+        vis = self._overlay(img.copy(), det)
+        bin_vis = self._binary_view(det) if self.show_binary else None
+        self.proc_ms = (time.perf_counter() - t0) * 1000
+        return vis, n, d, bin_vis
+
+    def _binary_view(self, det):
+        if det is None:
+            return None
+        mask, _, _, _, _, (h, w), hist, thresh = det
+        base = cv2.cvtColor(cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+        vis = self._overlay(base, det)
+        if hist is not None:
+            draw_histogram(vis, hist, thresh)
+        return vis
+
+    def _overlay(self, vis, det):
+        """在畫面上畫 ROI 框、水滴圈與狀態文字（原圖與二值化畫面共用）。"""
+        _, rois, all_blobs, s, n = det[:5]
+        lw = max(2, vis.shape[1] // 600)
         for i, ((x1, y1, x2, y2), blobs) in enumerate(zip(rois, all_blobs)):
             c = ROI_COLORS[i % len(ROI_COLORS)]
             cv2.rectangle(vis, (int(x1 / s), int(y1 / s)), (int(x2 / s), int(y2 / s)), c, lw)
@@ -1335,12 +1471,11 @@ class LiveDropApp:
                 rad = max(6, int(np.sqrt(area / np.pi) / s) + 4)
                 cv2.circle(vis, (int((cx + x1) / s), int((cy + y1) / s)), rad, (0, 200, 255), lw)
         text = f'{datetime.now():%Y-%m-%d %H:%M:%S}  {"WET" if self.is_wet else "DRY"}  drops={n}'
-        org = (20, img.shape[0] - 24)
+        org = (20, vis.shape[0] - 24)
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), lw + 4, cv2.LINE_AA)
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4,
                     (0, 60, 255) if self.is_wet else (60, 220, 60), lw, cv2.LINE_AA)
-        self.proc_ms = (time.perf_counter() - t0) * 1000
-        return vis, n, d
+        return vis
 
     def _process_loop(self):
         """背景執行緒：解拜耳 → 偵測 → 寫紀錄 → 縮成畫布大小。OpenCV 運算時會釋放 GIL。"""
@@ -1356,11 +1491,12 @@ class LiveDropApp:
             data, w, h, last = latest
             try:
                 frame = to_bgr(data, w, h, self.grabber.pixel_format)
-                vis, n, chi2 = self._detect(frame, dict(self.params))
+                vis, n, chi2, bin_vis = self._detect(frame, dict(self.params))
                 with self.lock:
                     if self.session and self.session.running:
-                        self.session.add(n, self.is_wet, chi2, vis)
-                view = self._fit_view(vis) if self.page == 'live' else None
+                        self.session.add(n, self.is_wet, chi2, vis)      # 紀錄一律存原圖畫面
+                shown = bin_vis if bin_vis is not None else vis
+                view = self._fit_view(shown) if self.page == 'live' else None
                 self.result = (frame, vis, n, chi2, view, last)
             except Exception as e:     # 單張失敗不要讓執行緒整個停掉
                 print(f'[警告] 處理影像失敗：{e!r}')
