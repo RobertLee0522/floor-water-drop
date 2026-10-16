@@ -146,6 +146,7 @@ ACCEL_REPEAT_MS = 250       # 加速參數的連發間隔（比一般慢，才�
 METHOD_ONLY = {'sigma': 'B', 'kernel': 'B', 'thresh': 'A'}     # 只有該偵測方法才用到的參數
 ROW_THRESH_RATIO = 1.3
 ROI_PADDING = 30
+AREA_COLOR = (255, 200, 0)  # 面積模式的填色（BGR：青藍）
 ROI_COLORS = [(0, 220, 255), (255, 120, 0), (180, 0, 255), (0, 255, 120), (255, 0, 160)]
 SNAPSHOT_W = 1280           # 事件截圖寬度
 FLUSH_SEC = 60              # 監測紀錄每隔幾秒寫進硬碟一次
@@ -232,6 +233,16 @@ def find_blobs(binary, min_area, max_area, split=0):
         n, _, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
         blobs = [(centroids[i][0], centroids[i][1], stats[i, cv2.CC_STAT_AREA]) for i in range(1, n)]
     return [b for b in blobs if min_area <= b[2] <= max_area]
+
+
+def area_mask(binary, min_area, max_area):
+    """二值圖中面積在 [min_area, max_area] 的亮塊像素（bool），面積模式用。
+    以整塊相連亮塊判斷，不受「分開相連水滴」影響：面積看的是二值化的白色像素本身。"""
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    a = stats[:, cv2.CC_STAT_AREA]
+    keep = (a >= min_area) & (a <= max_area)
+    keep[0] = False
+    return keep[labels]
 
 
 def draw_histogram(vis, hist, thresh):
@@ -372,32 +383,38 @@ class Session:
         self._open = None
         self.loaded = False         # True：從硬碟讀回的舊紀錄
         self._init_stats()
-        self._pending = []          # 還沒寫進 frames.csv 的紀錄 (經過秒數, 水滴數, wet, chi2)
+        self._pending = []          # 還沒寫進 frames.csv 的紀錄 (經過秒數, 水滴數, 面積 px, 面積 %, wet, chi2)
         self._last_flush = time.monotonic()
+        self.has_area = True
         with open(self.dir / 'frames.csv', 'w', newline='', encoding='utf-8-sig') as f:
-            csv.writer(f).writerow(['elapsed_s', 'time', 'drops', 'wet', 'hist_chi2'])
+            csv.writer(f).writerow(['elapsed_s', 'time', 'drops', 'area_px', 'area_pct', 'wet', 'hist_chi2'])
 
     def _init_stats(self):
         self.n_frames = self.n_wet = self.sum_drops = 0
         self.max_drops = None
+        self.sum_area = self.max_area = 0.0     # 面積佔比（%）
         self.last_t = 0.0
-        self.series = []            # 曲線用 [經過秒數, 區間內最大水滴數]，點數固定在 CHART_POINTS～2 倍之間
+        self.series = []            # 曲線用 [經過秒數, 區間內最大水滴數, 區間內最大面積 %]，點數固定在 CHART_POINTS～2 倍之間
         self._bucket, self._bucket_fill = 1, 0
 
-    def _track(self, t, n, wet):
+    def _track(self, t, n, wet, pct=0.0):
         self.n_frames += 1
         self.n_wet += bool(wet)
         self.sum_drops += n
         self.max_drops = n if self.max_drops is None else max(self.max_drops, n)
+        self.sum_area += pct
+        self.max_area = max(self.max_area, pct)
         self.last_t = t
         if self._bucket_fill == 0:
-            self.series.append([t, n])
+            self.series.append([t, n, pct])
         else:
-            self.series[-1][1] = max(self.series[-1][1], n)
+            last = self.series[-1]
+            last[1], last[2] = max(last[1], n), max(last[2], pct)
         self._bucket_fill = (self._bucket_fill + 1) % self._bucket
         if len(self.series) >= 2 * CHART_POINTS:     # 點太多：相鄰兩點合併（取最大值保留尖峰）
             s = self.series
-            self.series = [[s[i][0], max(s[i][1], s[i + 1][1])] for i in range(0, len(s), 2)]
+            self.series = [[s[i][0], max(s[i][1], s[i + 1][1]), max(s[i][2], s[i + 1][2])]
+                           for i in range(0, len(s), 2)]
             self._bucket *= 2
             self._bucket_fill = 0
 
@@ -408,17 +425,18 @@ class Session:
     def elapsed(self):
         return ((self.end or datetime.now()) - self.start).total_seconds()
 
-    def add(self, n, wet, chi2, vis_bgr):
+    def add(self, n, area_px, pct, wet, chi2, vis_bgr):
         t = self.elapsed()
-        self._track(t, n, wet)
-        self._pending.append((t, n, wet, chi2))
+        self._track(t, n, wet, pct)
+        self._pending.append((t, n, area_px, pct, wet, chi2))
         if wet and self._open is None:
             self._open = {'id': len(self.events) + 1, 'start': t, 'end': t, 'max_drops': -1,
-                          'image': None, 'file': None, 'dirty': False}
+                          'max_area_pct': 0.0, 'image': None, 'file': None, 'dirty': False}
             self.events.append(self._open)
         if self._open is not None:
             ev = self._open
             ev['end'] = t
+            ev['max_area_pct'] = max(ev['max_area_pct'], pct)
             if n > ev['max_drops']:
                 ev['max_drops'] = n
                 h, w = vis_bgr.shape[:2]
@@ -450,9 +468,9 @@ class Session:
             t0 = self.start.timestamp()
             with open(self.dir / 'frames.csv', 'a', newline='', encoding='utf-8-sig') as f:
                 w = csv.writer(f)
-                for t, n, wet, d in self._pending:
+                for t, n, area_px, pct, wet, d in self._pending:
                     ts = datetime.fromtimestamp(t0 + t).strftime('%H:%M:%S.%f')[:-3]
-                    w.writerow([f'{t:.3f}', ts, n, int(wet), f'{d:.4f}'])
+                    w.writerow([f'{t:.3f}', ts, n, int(area_px), f'{pct:.4f}', int(wet), f'{d:.4f}'])
             self._pending = []
         if self._open is not None:
             self._write_snapshot(self._open)     # 進行中的事件先存一張目前的截圖
@@ -461,7 +479,8 @@ class Session:
     def _write_meta(self):
         meta = {'start': self.start.isoformat(), 'end': self.end.isoformat() if self.end else None,
                 'params': self.params, 'rois': [list(r) for r in self.rois],
-                'events': [{k: ev[k] for k in ('id', 'start', 'end', 'max_drops', 'file')} for ev in self.events]}
+                'events': [{k: ev.get(k) for k in ('id', 'start', 'end', 'max_drops', 'max_area_pct', 'file')}
+                           for ev in self.events]}
         (self.dir / 'session.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def stop(self):
@@ -493,6 +512,8 @@ class Session:
             'WET 累計時間': fmt_duration(wet_time),
             '最大水滴數': f'{self.max_drops}' if n else '-',
             '平均水滴數': f'{self.sum_drops / n:.1f}' if n else '-',
+            '最大面積佔比': f'{self.max_area:.2f}%' if n and self.has_area else '-',
+            '平均面積佔比': f'{self.sum_area / n:.2f}%' if n and self.has_area else '-',
         }
 
     def export(self):
@@ -517,10 +538,12 @@ class Session:
             meta = None
         legacy, first_time = [], None       # 舊版沒有 session.json，事件要從紀錄重建
         with open(folder / 'frames.csv', newline='', encoding='utf-8-sig') as f:
-            for row in csv.DictReader(f):
+            reader = csv.DictReader(f)
+            s.has_area = 'area_pct' in (reader.fieldnames or [])    # 舊版紀錄沒有面積
+            for row in reader:
                 first_time = first_time or row['time']
                 rec = (float(row['elapsed_s']), int(row['drops']), row['wet'] == '1', float(row['hist_chi2']))
-                s._track(*rec[:3])
+                s._track(*rec[:3], float(row['area_pct']) if s.has_area else 0.0)
                 if meta is None:
                     legacy.append(rec)
         if meta:
@@ -592,35 +615,39 @@ def _rebuild_events(records, folder):
 
 # ─────────── HTML 報表 ───────────
 
-def chart_svg(session, width=1000, height=280):
+def chart_svg(session, col=1, width=1000, height=280):
+    """col=1：水滴數曲線（含 WET 門檻線）；col=2：面積佔比（%）曲線。"""
     recs = session.series
     pad_l, pad_r, pad_t, pad_b = 48, 16, 14, 34
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
     dur = max(session.elapsed(), 1e-6)
-    thresh = session.params.get('wet_count', DETECT_DEFAULTS['wet_count'])
-    ymax = max([r[1] for r in recs] + [thresh]) * 1.1 or 1
+    thresh = session.params.get('wet_count', DETECT_DEFAULTS['wet_count']) if col == 1 else None
+    ymax = max([r[col] for r in recs] + [thresh or 0]) * 1.1 or 1
+    fmt = '{:.0f}' if col == 1 else '{:.2f}%'
     x = lambda t: pad_l + t / dur * pw
     y = lambda v: pad_t + ph - v / ymax * ph
-    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="水滴數時間曲線">']
+    name = '水滴數' if col == 1 else '面積佔比'
+    parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{name}時間曲線">']
     for ev in session.events:
         x0, x1 = x(ev['start']), x(ev['end'])
         parts.append(f'<rect class="wet" x="{x0:.1f}" y="{pad_t}" width="{max(x1 - x0, 2):.1f}" height="{ph}"/>')
     for i in range(5):
         v = ymax * i / 4
         parts.append(f'<line class="grid" x1="{pad_l}" x2="{width - pad_r}" y1="{y(v):.1f}" y2="{y(v):.1f}"/>'
-                     f'<text class="ax" x="{pad_l - 6}" y="{y(v) + 4:.1f}" text-anchor="end">{v:.0f}</text>')
+                     f'<text class="ax" x="{pad_l - 6}" y="{y(v) + 4:.1f}" text-anchor="end">{fmt.format(v)}</text>')
     for i in range(6):
         t = dur * i / 5
         parts.append(f'<text class="ax" x="{x(t):.1f}" y="{height - 10}" text-anchor="middle">{fmt_duration(t)}</text>')
-    parts.append(f'<line class="th" x1="{pad_l}" x2="{width - pad_r}" y1="{y(thresh):.1f}" y2="{y(thresh):.1f}"/>')
+    if thresh is not None:
+        parts.append(f'<line class="th" x1="{pad_l}" x2="{width - pad_r}" y1="{y(thresh):.1f}" y2="{y(thresh):.1f}"/>')
     if recs:
         # 點太多時每個區間取最大值，避免檔案過大又保留尖峰
         bucket = max(1, len(recs) // 1500)
         pts = []
         for i in range(0, len(recs), bucket):
             chunk = recs[i:i + bucket]
-            pts.append(f'{x(chunk[0][0]):.1f},{y(max(r[1] for r in chunk)):.1f}')
-        parts.append(f'<polyline class="line" points="{" ".join(pts)}"/>')
+            pts.append(f'{x(chunk[0][0]):.1f},{y(max(r[col] for r in chunk)):.1f}')
+        parts.append(f'<polyline class="{"line" if col == 1 else "line area"}" points="{" ".join(pts)}"/>')
     parts.append('</svg>')
     return ''.join(parts)
 
@@ -642,18 +669,22 @@ def render_html(session):
         t0 = datetime.fromtimestamp(session.start.timestamp() + ev['start']).strftime('%H:%M:%S')
         img = (f'<a href="{e(ev["file"])}"><img src="{e(ev["file"])}" alt="事件 {ev["id"]} 截圖" loading="lazy"></a>'
                if ev['file'] else '—')
+        pct = f'{ev["max_area_pct"]:.2f}%' if ev.get('max_area_pct') is not None else '—'
         ev_rows.append(f'<tr><td>{ev["id"]}</td><td>{t0}</td><td>{fmt_duration(ev["end"] - ev["start"])}</td>'
-                       f'<td>{ev["max_drops"]}</td><td>{img}</td></tr>')
+                       f'<td>{ev["max_drops"]}</td><td>{pct}</td><td>{img}</td></tr>')
+    area_chart = (f'<h2>面積佔比時間曲線</h2>\n<div class="panel">{chart_svg(session, 2)}\n'
+                  f'<div class="legend">橘線：二值化後白色像素（水滴、水漬）佔 ROI 的比例　紅色底色：WET 事件期間</div></div>'
+                  if session.has_area else '')
     return f'''<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>水滴偵測報表 {e(summary["開始時間"])}</title>
 <style>
 :root {{ --bg:#f8fafc; --card:#fff; --text:#0f172a; --muted:#64748b; --line:#e2e8f0;
-        --accent:#0284c7; --wet:rgba(239,68,68,.16); --th:#ef4444; }}
+        --accent:#0284c7; --area:#d97706; --wet:rgba(239,68,68,.16); --th:#ef4444; }}
 @media (prefers-color-scheme: dark) {{
   :root {{ --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8; --line:#334155;
-          --accent:#38bdf8; --wet:rgba(239,68,68,.25); --th:#f87171; }} }}
+          --accent:#38bdf8; --area:#fbbf24; --wet:rgba(239,68,68,.25); --th:#f87171; }} }}
 body {{ margin:0; background:var(--bg); color:var(--text);
        font-family:"Noto Sans TC","Microsoft JhengHei","Droid Sans Fallback",sans-serif; }}
 main {{ max-width:1100px; margin:0 auto; padding:24px 16px 48px; }}
@@ -665,7 +696,7 @@ h1 {{ font-size:1.5rem; margin:0 0 4px; }} h2 {{ font-size:1.1rem; margin:28px 0
 .panel {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; overflow-x:auto; }}
 svg {{ width:100%; height:auto; display:block; }}
 svg .grid {{ stroke:var(--line); }} svg .ax {{ fill:var(--muted); font-size:11px; }}
-svg .line {{ fill:none; stroke:var(--accent); stroke-width:1.5; }}
+svg .line {{ fill:none; stroke:var(--accent); stroke-width:1.5; }} svg .area {{ stroke:var(--area); }}
 svg .th {{ stroke:var(--th); stroke-dasharray:5 4; }} svg .wet {{ fill:var(--wet); }}
 .legend {{ color:var(--muted); font-size:.85rem; margin-top:6px; }}
 table {{ border-collapse:collapse; width:100%; }}
@@ -680,9 +711,10 @@ td img {{ width:240px; max-width:100%; border-radius:6px; display:block; }}
 <h2>水滴數時間曲線</h2>
 <div class="panel">{chart_svg(session)}
 <div class="legend">藍線：水滴數　紅色虛線：WET 門檻（{e(str(p.get("wet_count")))}）　紅色底色：WET 事件期間</div></div>
+{area_chart}
 <h2>WET 事件（{len(session.events)}）</h2>
-<div class="panel"><table><thead><tr><th>#</th><th>開始</th><th>持續</th><th>最大水滴數</th><th>截圖（點開看大圖）</th></tr></thead>
-<tbody>{"".join(ev_rows) or '<tr><td colspan="5">監測期間沒有 WET 事件</td></tr>'}</tbody></table></div>
+<div class="panel"><table><thead><tr><th>#</th><th>開始</th><th>持續</th><th>最大水滴數</th><th>最大面積</th><th>截圖（點開看大圖）</th></tr></thead>
+<tbody>{"".join(ev_rows) or '<tr><td colspan="6">監測期間沒有 WET 事件</td></tr>'}</tbody></table></div>
 <h2>偵測參數</h2>
 <div class="panel"><table><tbody>{"".join(f"<tr><th>{e(str(k))}</th><td>{e(str(v))}</td></tr>" for k, v in param_lines(p, session.rois))}</tbody></table></div>
 <p class="sub">每張影像的原始紀錄：frames.csv</p>
@@ -713,12 +745,14 @@ class LiveDropApp:
         self._drag = None
         self.paused = False
         self.show_binary = False    # 即時畫面改顯示二值化結果
+        self.show_area = False      # 面積模式：畫面塗出白色像素、上方顯示面積佔比（只影響顯示，兩種數據都會記錄）
         self._last_det = None       # 最近一次偵測的 (二值圖, ROI, 水滴, 縮放, 數量, 原圖大小)，暫停時切換顯示用
         self.prev_hist = None
         self.last_seq = 0
         self.frame_bgr = None
         self.vis_bgr = None
         self.n_drops = 0
+        self.area_pct = 0.0
         self.chi2 = 0.0
         self.is_wet = False
         self._streak = 0            # 與目前狀態相反的連續張數
@@ -817,7 +851,8 @@ class LiveDropApp:
         self.count_lbl = tk.Label(top, text='0', bg=C_PANEL, fg=C_TEXT, font=(FONT, 32, 'bold'), width=4,
                                   anchor='e')
         self.count_lbl.pack(side='left')
-        tk.Label(top, text='顆', bg=C_PANEL, fg=C_MUTED, font=(FONT, 16)).pack(side='left', padx=(2, 12))
+        self.unit_lbl = tk.Label(top, text='顆', bg=C_PANEL, fg=C_MUTED, font=(FONT, 16), width=2, anchor='w')
+        self.unit_lbl.pack(side='left', padx=(2, 12))
         self.info_lbl = tk.Label(top, text='', bg=C_PANEL, fg=C_MUTED, font=(FONT, 12), justify='left',
                                  anchor='w')
         self.info_lbl.pack(side='left', fill='x', expand=True)
@@ -829,6 +864,8 @@ class LiveDropApp:
         self.page_btn.pack(side='right', fill='y', padx=4, pady=8)
         self.bin_btn = self._btn(top, '二值化', self.toggle_binary, bg=C_BTN, size=18, width=5)
         self.bin_btn.pack(side='right', fill='y', padx=4, pady=8)
+        self.area_btn = self._btn(top, '面積', self.toggle_area, bg=C_BTN, size=18, width=4)
+        self.area_btn.pack(side='right', fill='y', padx=4, pady=8)
         self.mon_btn = self._btn(top, '開始監測', self.toggle_monitor, bg=C_GREEN, size=18, width=7)
         self.mon_btn.pack(side='right', fill='y', padx=4, pady=8)
 
@@ -1062,6 +1099,7 @@ class LiveDropApp:
             self.rois = [tuple(r) for r in saved.get('rois', [])]
             if saved.get('bayer') in BAYER_CHOICES:
                 self.set_bayer(saved['bayer'])
+            self.toggle_area(bool(saved.get('show_area', False)))
         except (OSError, ValueError):
             pass
         self._apply_all(params, force=True)
@@ -1069,7 +1107,8 @@ class LiveDropApp:
 
     def _save_settings(self):
         OUTPUT_DIR.mkdir(exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps({'params': self.params, 'rois': self.rois, 'bayer': self.bayer},
+        SETTINGS_FILE.write_text(json.dumps({'params': self.params, 'rois': self.rois, 'bayer': self.bayer,
+                                             'show_area': self.show_area},
                                             ensure_ascii=False, indent=2))
 
     def _save_bayer(self):
@@ -1206,6 +1245,18 @@ class LiveDropApp:
         self.show_binary = not self.show_binary
         c = C_ACCENT if self.show_binary else C_BTN
         self.bin_btn.config(text='看原圖' if self.show_binary else '二值化', bg=c, activebackground=c)
+        self._redraw_paused()
+
+    def toggle_area(self, on=None):
+        self.show_area = not self.show_area if on is None else on
+        c = C_ACCENT if self.show_area else C_BTN
+        self.area_btn.config(text='數量' if self.show_area else '面積', bg=c, activebackground=c)
+        self.unit_lbl.config(text='%' if self.show_area else '顆')
+        if self.paused and self.frame_bgr is not None and self._last_det is not None:
+            self.vis_bgr = self._overlay(self.frame_bgr.copy(), self._last_det)
+        self._redraw_paused()
+
+    def _redraw_paused(self):
         if self.paused and self.vis_bgr is not None and self.page == 'live':    # 暫停中也立刻換畫面
             img = self._binary_view(self._last_det) if self.show_binary else self.vis_bgr
             if img is not None:
@@ -1312,6 +1363,13 @@ class LiveDropApp:
         gh = 240
         self._draw_chart(c, 0, y, W, gh, s)
         y += gh + 18
+        if s.has_area:
+            c.create_text(0, y + 12, text='面積佔比時間曲線', fill=C_ACCENT, font=(FONT, 16, 'bold'), anchor='w')
+            c.create_text(W, y + 12, text='橘線：白色像素佔 ROI 比例　紅底：WET 期間', fill=C_MUTED,
+                          font=(FONT, 12), anchor='e')
+            y += 30
+            self._draw_chart(c, 0, y, W, gh, s, col=2)
+            y += gh + 18
 
         # 事件清單
         c.create_text(0, y + 12, text=f'WET 事件（{len(s.events)}）', fill=C_ACCENT, font=(FONT, 16, 'bold'),
@@ -1338,7 +1396,8 @@ class LiveDropApp:
             c.create_text(tw + 30, y + 34, text=f"事件 {ev['id']}", fill=C_TEXT, font=(FONT, 20, 'bold'), anchor='w')
             c.create_text(tw + 30, y + 64, anchor='nw', fill=C_TEXT, font=(FONT, 15),
                           text=f"開始：{t0:%H:%M:%S}\n持續：{fmt_duration(ev['end'] - ev['start'])}\n"
-                               f"最大水滴數：{ev['max_drops']}")
+                               f"最大水滴數：{ev['max_drops']}"
+                               + (f"\n最大面積：{ev['max_area_pct']:.2f}%" if ev.get('max_area_pct') is not None else ''))
             y += th + 22
 
         # 參數
@@ -1352,14 +1411,16 @@ class LiveDropApp:
         c.configure(scrollregion=(0, 0, W, y))
         c.yview_moveto(0)
 
-    def _draw_chart(self, c, x0, y0, w, h, s):
+    def _draw_chart(self, c, x0, y0, w, h, s, col=1):
+        """col=1：水滴數（含 WET 門檻線）；col=2：面積佔比（%）。"""
         c.create_rectangle(x0, y0, x0 + w, y0 + h, fill=C_PANEL, outline='')
         pl, pr, pt, pb = 56, 16, 14, 30
         pw, ph = w - pl - pr, h - pt - pb
         dur = max(s.elapsed(), 1e-6)
-        thresh = s.params.get('wet_count', DETECT_DEFAULTS['wet_count'])
+        thresh = s.params.get('wet_count', DETECT_DEFAULTS['wet_count']) if col == 1 else None
         recs = s.series
-        ymax = max([r[1] for r in recs] + [thresh]) * 1.1 or 1
+        ymax = max([r[col] for r in recs] + [thresh or 0]) * 1.1 or 1
+        fmt = '{:.0f}' if col == 1 else '{:.2f}%'
         X = lambda t: x0 + pl + t / dur * pw
         Y = lambda v: y0 + pt + ph - v / ymax * ph
         for ev in s.events:
@@ -1368,19 +1429,20 @@ class LiveDropApp:
         for i in range(5):
             v = ymax * i / 4
             c.create_line(x0 + pl, Y(v), x0 + pl + pw, Y(v), fill=C_CARD)
-            c.create_text(x0 + pl - 8, Y(v), text=f'{v:.0f}', fill=C_MUTED, font=(FONT, 11), anchor='e')
+            c.create_text(x0 + pl - 8, Y(v), text=fmt.format(v), fill=C_MUTED, font=(FONT, 11), anchor='e')
         for i in range(6):
             t = dur * i / 5
             c.create_text(X(t), y0 + h - 13, text=fmt_duration(t), fill=C_MUTED, font=(FONT, 11))
-        c.create_line(x0 + pl, Y(thresh), x0 + pl + pw, Y(thresh), fill='#f87171', dash=(6, 4))
+        if thresh is not None:
+            c.create_line(x0 + pl, Y(thresh), x0 + pl + pw, Y(thresh), fill='#f87171', dash=(6, 4))
         if len(recs) > 1:
             bucket = max(1, len(recs) // pw)
             pts = []
             for i in range(0, len(recs), bucket):
                 chunk = recs[i:i + bucket]
-                pts += [X(chunk[0][0]), Y(max(r[1] for r in chunk))]
+                pts += [X(chunk[0][0]), Y(max(r[col] for r in chunk))]
             if len(pts) >= 4:
-                c.create_line(*pts, fill='#38bdf8', width=2)
+                c.create_line(*pts, fill='#38bdf8' if col == 1 else '#fbbf24', width=2)
 
     def export_report(self):
         s = self._report_session(self.report_dir) if self.report_dir else None
@@ -1409,10 +1471,14 @@ class LiveDropApp:
         all_blobs = []
         hist = np.zeros(256, np.float64)    # 二值化畫面的直方圖（ROI 內；每張都算，暫停時切換也有）
         mask = np.zeros_like(gray)      # 各 ROI 的二值化結果拼回整張，給「二值化」畫面用
+        wet_px = np.zeros(gray.shape, bool)     # 面積：通過面積篩選的白色像素
+        in_roi = np.zeros(gray.shape, bool)
+        roi_pct = []                    # 各 ROI 的面積佔比（%）
         for x1, y1, x2, y2 in rois:
             roi = gray[y1:y2, x1:x2]
             if roi.size == 0:
                 all_blobs.append([])
+                roi_pct.append(0.0)
                 continue
             if p['method'] == 'B':
                 binary = detect_method_b(roi, p['sigma'], max(3, p['kernel'] * s))
@@ -1423,7 +1489,15 @@ class LiveDropApp:
             hist += cv2.calcHist([src], [0], None, [256], [0, 256]).flatten()
             mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], binary)
             all_blobs.append(find_blobs(binary, min_a, max_a, p['split'] * s))
+            keep = area_mask(binary, min_a, max_a)
+            wet_px[y1:y2, x1:x2] |= keep
+            in_roi[y1:y2, x1:x2] = True
+            roi_pct.append(keep.mean() * 100)
         n = sum(len(b) for b in all_blobs)
+        # ROI 重疊時像素只算一次；面積換回原圖像素
+        n_px = int(np.count_nonzero(wet_px))
+        area_px = n_px / (s * s)
+        area_pct = n_px / max(1, np.count_nonzero(in_roi)) * 100
 
         x1, y1, x2, y2 = rois[0]
         roi0 = gray[y1:y2, x1:x2]
@@ -1441,17 +1515,17 @@ class LiveDropApp:
             self._streak = 0
 
         thresh = int(p['thresh']) if p['method'] == 'A' else None
-        det = (mask, rois, all_blobs, s, n, img.shape[:2], hist, thresh)
+        det = (mask, rois, all_blobs, s, n, img.shape[:2], hist, thresh, wet_px, roi_pct, area_px, area_pct)
         self._last_det = det
         vis = self._overlay(img.copy(), det)
         bin_vis = self._binary_view(det) if self.show_binary else None
         self.proc_ms = (time.perf_counter() - t0) * 1000
-        return vis, n, d, bin_vis
+        return vis, n, d, bin_vis, area_px, area_pct
 
     def _binary_view(self, det):
         if det is None:
             return None
-        mask, _, _, _, _, (h, w), hist, thresh = det
+        mask, _, _, _, _, (h, w), hist, thresh = det[:8]
         base = cv2.cvtColor(cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
         vis = self._overlay(base, det)
         if hist is not None:
@@ -1459,18 +1533,40 @@ class LiveDropApp:
         return vis
 
     def _overlay(self, vis, det):
-        """在畫面上畫 ROI 框、水滴圈與狀態文字（原圖與二值化畫面共用）。"""
+        """在畫面上畫 ROI 框、水滴圈（數量模式）或白色像素填色（面積模式）與狀態文字（原圖與二值化畫面共用）。"""
         _, rois, all_blobs, s, n = det[:5]
+        wet_px, roi_pct, area_px, area_pct = det[8:12]
+        show_area = self.show_area
         lw = max(2, vis.shape[1] // 600)
+        if show_area:
+            # 面積模式：二值化後算進面積的像素直接塗色（二值化畫面中，被面積篩掉的仍是白色）
+            # 只處理有白色像素的外框範圍，全幅混色太慢
+            bx, by, bw, bh = cv2.boundingRect(wet_px.astype(np.uint8))
+            if bw and bh:
+                H, W = vis.shape[:2]
+                X1, Y1 = int(bx / s), int(by / s)
+                X2, Y2 = min(W, int(np.ceil((bx + bw) / s))), min(H, int(np.ceil((by + bh) / s)))
+                big = cv2.resize(wet_px[by:by + bh, bx:bx + bw].astype(np.uint8), (X2 - X1, Y2 - Y1),
+                                 interpolation=cv2.INTER_NEAREST)
+                sub = vis[Y1:Y2, X1:X2]
+                mixed = cv2.addWeighted(sub, 0.35, np.full_like(sub, AREA_COLOR), 0.65, 0)
+                cv2.copyTo(mixed, big, sub)
+                contours, _ = cv2.findContours(big, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=(X1, Y1))
+                cv2.drawContours(vis, contours, -1, AREA_COLOR, max(1, lw // 2))
         for i, ((x1, y1, x2, y2), blobs) in enumerate(zip(rois, all_blobs)):
             c = ROI_COLORS[i % len(ROI_COLORS)]
             cv2.rectangle(vis, (int(x1 / s), int(y1 / s)), (int(x2 / s), int(y2 / s)), c, lw)
-            cv2.putText(vis, f'ROI {i + 1}: {len(blobs)}', (int(x1 / s) + 8, int(y1 / s) + 44),
+            label = f'ROI {i + 1}: {roi_pct[i]:.2f}%' if show_area else f'ROI {i + 1}: {len(blobs)}'
+            cv2.putText(vis, label, (int(x1 / s) + 8, int(y1 / s) + 44),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, c, lw + 1, cv2.LINE_AA)
+            if show_area:
+                continue
             for cx, cy, area in blobs:
                 rad = max(6, int(np.sqrt(area / np.pi) / s) + 4)
                 cv2.circle(vis, (int((cx + x1) / s), int((cy + y1) / s)), rad, (0, 200, 255), lw)
         text = f'{datetime.now():%Y-%m-%d %H:%M:%S}  {"WET" if self.is_wet else "DRY"}  drops={n}'
+        if show_area:
+            text += f'  area={area_pct:.2f}% ({area_px:.0f}px)'
         org = (20, vis.shape[0] - 24)
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), lw + 4, cv2.LINE_AA)
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4,
@@ -1491,13 +1587,13 @@ class LiveDropApp:
             data, w, h, last = latest
             try:
                 frame = to_bgr(data, w, h, self.grabber.pixel_format)
-                vis, n, chi2, bin_vis = self._detect(frame, dict(self.params))
+                vis, n, chi2, bin_vis, area_px, area_pct = self._detect(frame, dict(self.params))
                 with self.lock:
-                    if self.session and self.session.running:
-                        self.session.add(n, self.is_wet, chi2, vis)      # 紀錄一律存原圖畫面
+                    if self.session and self.session.running:     # 紀錄一律存原圖畫面；數量、面積兩種都記
+                        self.session.add(n, area_px, area_pct, self.is_wet, chi2, vis)
                 shown = bin_vis if bin_vis is not None else vis
                 view = self._fit_view(shown) if self.page == 'live' else None
-                self.result = (frame, vis, n, chi2, view, last)
+                self.result = (frame, vis, n, chi2, view, area_pct, last)
             except Exception as e:     # 單張失敗不要讓執行緒整個停掉
                 print(f'[警告] 處理影像失敗：{e!r}')
 
@@ -1505,13 +1601,16 @@ class LiveDropApp:
         res = self.result
         if res is not None and res[-1] != self.last_seq:
             self.last_seq = res[-1]
-            self.frame_bgr, self.vis_bgr, self.n_drops, self.chi2, view = res[:5]
+            self.frame_bgr, self.vis_bgr, self.n_drops, self.chi2, view, self.area_pct = res[:6]
             if self.page == 'live':
                 self._put_view(view or self._fit_view(self.vis_bgr))
 
         color = C_RED if self.is_wet else C_GREEN
         self.status_lbl.config(text='WET' if self.is_wet else 'DRY', bg=color)
-        self.count_lbl.config(text=str(self.n_drops))
+        if self.show_area:
+            self.count_lbl.config(text=f'{self.area_pct:.2f}' if self.area_pct < 10 else f'{self.area_pct:.1f}')
+        else:
+            self.count_lbl.config(text=str(self.n_drops))
         mon = ''
         if self.session and self.session.running:
             mon = f'\n● 監測中 {fmt_duration(self.session.elapsed())}　事件 {len(self.session.events)}'
