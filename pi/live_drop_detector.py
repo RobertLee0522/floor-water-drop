@@ -96,6 +96,9 @@ DETECT_DEFAULTS = {
     'wet_frames': 3,        # 連續幾張符合才切換 WET / DRY（避免閃爍）
     'cover_r': 40,          # 均勻度：每顆水滴向外擴的半徑（原圖像素）
     'uni_ratio': 0.6,       # 均勻度：左右覆蓋面積比低於此值判定不均勻
+    'uni_algo': 'cover',    # 均勻度算法：'cover' 覆蓋面積 / 'kde' 核密度估計
+    'kde_h': 120,           # KDE：Quartic 核頻寬（原圖像素）
+    'kde_ratio': 0.4,       # KDE：左右平均密度比低於此值判定不均勻
 }
 
 # 參數面板：(key, 名稱, 下限, 上限, 步進, 小數位)；步進為 None 表示乘法調整
@@ -125,6 +128,8 @@ PARAM_GROUPS = {
         ('wet_frames', '連續幾張才切換', 1, 30, 1, 0),
         ('cover_r', '均勻：水滴外擴 (px)', 5, 300, 5, 0),
         ('uni_ratio', '均勻：左右比 <', 0.1, 1.0, 0.05, 2),
+        ('kde_h', 'KDE：頻寬 h (px)', 20, 400, 10, 0),
+        ('kde_ratio', 'KDE：左右密度比 <', 0.05, 1.0, 0.05, 2),
     ],
 }
 # 參數說明：點參數名稱或按 −/＋ 時顯示在面板空白處
@@ -145,6 +150,9 @@ PARAM_HELP = {
     'circ': '方法C的形狀篩選：1為正圓，越小越不規則。\n圓度低於此值的暗點（細長紋路、刮痕）不算水滴。\n紋路被圈起來→調大\n形狀不圓的水滴被漏掉→調小',
     'cover_r': '均勻模式用：每顆水滴向外擴成這個半徑（原圖像素）的圓，重疊處連成覆蓋區（綠色）。\n綠色太零碎、看不出分布→調大\n整片都變綠、分不出差異→調小\n改這個值所有覆蓋面積%都會跟著變。',
     'uni_ratio': '均勻模式用：ROI左右兩半的覆蓋面積，少的÷多的低於此值就判定「不均勻」。\n1 = 左右完全一樣。\n均勻噴灑卻常判不均勻→調小\n明顯一邊空白卻判均勻→調大',
+    'uni_algo': '均勻度的算法（「均勻」模式看得到結果）。\n覆蓋面積：每顆水滴外擴成圓，比較左右兩半被蓋到的面積；水滴多時會飽和，比值偏高。\n核密度 KDE：把水滴點用 Quartic 核平滑成連續的密度熱點圖（藍→紅＝疏→密），比較左右平均密度；對一邊偏少更敏感。\n下方只列出目前算法用得到的參數。',
+    'kde_h': 'KDE的頻寬（原圖像素）：每顆水滴的影響範圍，決定熱點圖平滑程度。\n熱點圖一顆一顆、看不出分布→調大\n整片糊成一團、看不出疏密→調小\n建議 60～150。',
+    'kde_ratio': 'KDE模式用：ROI左右兩半的平均水滴密度，少的÷多的低於此值就判定「不均勻」。\n1 = 左右密度完全一樣。\n均勻噴灑卻常判不均勻→調小\n明顯一邊空白卻判均勻→調大',
     'sigma': '方法B的靈敏度：亮點要比背景亮多少才算。\n數字越小越敏感。\n雜訊、紋路被圈起來→調大\n水滴沒被圈到→調小',
     'kernel': '方法B的範圍大小（原圖像素）。比它小的亮點才會被找出來。\n約設成水滴直徑的2倍。\n大水滴只圈到一部分或漏抓→調大\n反光、大片亮區被圈→調小（數字越大也越慢）',
     'thresh': '方法A的亮度門檻（0～255），比它亮的地方算水滴。\n背景也被圈起來→調大\n水滴沒被圈到→調小\n點一下±1，按住±5，按久一點±10。\n按「二值化」可在畫面右下看直方圖與門檻線。',
@@ -164,6 +172,8 @@ ACCEL_REPEAT_MS = 250       # 加速參數的連發間隔（比一般慢，才�
 METHOD_ONLY = {'sigma': 'B', 'kernel': 'B', 'thresh': 'A',      # 只有該偵測方法才用到的參數
                'bh_sigma': 'C', 'bh_kernel': 'C', 'circ': 'C'}
 METHOD_NAMES = {'A': 'A：二值化', 'B': 'B：Top-hat', 'C': 'C：Black-hat 暗點'}
+UNI_ONLY = {'cover_r': 'cover', 'uni_ratio': 'cover', 'kde_h': 'kde', 'kde_ratio': 'kde'}    # 只有該均勻度算法才用到
+UNI_NAMES = {'cover': '覆蓋面積', 'kde': '核密度 KDE'}
 VIEW_MODES = ('count', 'area', 'uniform')       # 上方按鈕依序切換
 VIEW_NAMES = {'count': '數量', 'area': '面積', 'uniform': '均勻'}
 ROW_THRESH_RATIO = 1.3
@@ -249,6 +259,36 @@ def coverage(shape, blobs, radius):
     half = shape[1] // 2
     return (m > 0, int(np.count_nonzero(m[:, :half])), int(np.count_nonzero(m[:, half:])),
             (half * shape[0], (shape[1] - half) * shape[0]))
+
+
+_KDE_CACHE = {}
+
+
+def quartic_kernel(h):
+    """Quartic（biweight）核 K(d) = (1 - d²/h²)²，d < h；總和正規化為 1。"""
+    h = max(1.0, float(h))
+    r = int(np.ceil(h))
+    y, x = np.mgrid[-r:r + 1, -r:r + 1].astype(np.float32)
+    d2 = (x * x + y * y) / (h * h)
+    k = np.where(d2 < 1, (1 - d2) ** 2, 0).astype(np.float32)
+    return k / k.sum()
+
+
+def kde_density(shape, blobs, h):
+    """核密度估計：水滴中心點 → 連續密度面（每像素的水滴數）。
+    邊緣修正：除以核落在 ROI 內的比例，ROI 邊緣的密度才不會被低估。"""
+    key = (shape, round(float(h), 2))
+    if key not in _KDE_CACHE:
+        if len(_KDE_CACHE) > 16:
+            _KDE_CACHE.clear()
+        k = quartic_kernel(h)
+        w = cv2.filter2D(np.ones(shape, np.float32), -1, k, borderType=cv2.BORDER_CONSTANT)
+        _KDE_CACHE[key] = (k, np.maximum(w, 1e-6))
+    k, w = _KDE_CACHE[key]
+    m = np.zeros(shape, np.float32)
+    for cx, cy, _ in blobs:
+        m[min(int(cy), shape[0] - 1), min(int(cx), shape[1] - 1)] += 1
+    return cv2.filter2D(m, -1, k, borderType=cv2.BORDER_CONSTANT) / w
 
 
 def lr_ratio(left_pct, right_pct):
@@ -547,7 +587,8 @@ class Session:
                     ts = datetime.fromtimestamp(t0 + t).strftime('%H:%M:%S.%f')[:-3]
                     ratio = '' if u['ratio'] is None else f"{u['ratio']:.4f}"
                     w.writerow([f'{t:.3f}', ts, n, int(area_px), f'{pct:.4f}', int(wet), f'{d:.4f}',
-                                f"{u['cover']:.2f}", f"{u['left']:.2f}", f"{u['right']:.2f}", ratio,
+                                '' if u['cover'] is None else f"{u['cover']:.2f}",
+                                f"{u['left']:.2f}", f"{u['right']:.2f}", ratio,
                                 int(u['uneven'])])
             self._pending = []
         if self._open is not None:
@@ -667,6 +708,8 @@ def _legacy_params(report_file):
         k, v = html.unescape(k), html.unescape(v)
         if k == '偵測方法':
             params['method'] = v[0] if v[:1] in METHOD_NAMES else 'A'
+        elif k == '均勻度算法':
+            params['uni_algo'] = 'kde' if 'KDE' in v else 'cover'
         elif k == 'ROI':
             rois = [tuple(map(int, m)) for m in re.findall(r'\((\d+), (\d+), (\d+), (\d+)\)', v)]
         elif k in labels:
@@ -736,7 +779,8 @@ def chart_svg(session, col=1, width=1000, height=280):
 
 
 def param_lines(params, rois):
-    lines = [('偵測方法', METHOD_NAMES.get(params.get('method'), METHOD_NAMES['A']))]
+    lines = [('偵測方法', METHOD_NAMES.get(params.get('method'), METHOD_NAMES['A'])),
+             ('均勻度算法', UNI_NAMES.get(params.get('uni_algo'), UNI_NAMES['cover']))]
     for group in PARAM_GROUPS.values():
         lines += [(label, params.get(key, '—')) for key, label, *_ in group]
     lines.append(('ROI', ', '.join(str(tuple(r)) for r in rois) or '自動'))
@@ -820,6 +864,7 @@ class LiveDropApp:
         self._hold_key = None       # 正在長按的參數（加速用）
         self._hold_start = 0.0
         self._shown_method = None   # 偵測分頁目前列出哪個方法的參數
+        self._shown_uni = None      # 判定分頁目前列出哪個均勻度算法的參數
         self._help_job = None       # 畫面上說明框的自動關閉計時
 
         self.model = try_call(camera.get_model_name, default='') or ''
@@ -1027,8 +1072,23 @@ class LiveDropApp:
                 self.method_btns[val] = b
             self._shown_method = self.params['method']
             self._refresh_method()
+        if name == '判定':
+            row = tk.Frame(f, bg=C_PANEL)
+            row.pack(fill='x', pady=(0, 4))
+            lbl = tk.Label(row, text='均勻\n算法', bg=C_PANEL, fg=C_MUTED, font=(FONT, 12))
+            lbl.pack(side='left', padx=(4, 6))
+            lbl.bind('<ButtonPress-1>', lambda e: self._show_help('uni_algo'))
+            self.uni_btns = {}
+            for val, text in (('cover', '覆蓋面積'), ('kde', '核密度 KDE')):
+                b = self._btn(row, text, lambda v=val: (self._set_param('uni_algo', v), self._show_help('uni_algo')),
+                              size=14)
+                b.pack(side='left', expand=True, fill='x', padx=2, ipady=10)
+                self.uni_btns[val] = b
+            self._shown_uni = self.params['uni_algo']
         for key, label, lo, hi, step, digits in PARAM_GROUPS[name]:
             if METHOD_ONLY.get(key, self.params['method']) != self.params['method']:
+                continue
+            if UNI_ONLY.get(key, self.params['uni_algo']) != self.params['uni_algo']:
                 continue
             row = tk.Frame(f, bg=C_CARD)
             row.pack(fill='x', pady=3)
@@ -1071,7 +1131,7 @@ class LiveDropApp:
         if key is None:
             text = GROUP_HELP[self.group]
         else:
-            name = {'method': '偵測方法', 'bayer': '顏色排列'}.get(key) or self.specs[key][1]
+            name = {'method': '偵測方法', 'bayer': '顏色排列', 'uni_algo': '均勻度算法'}.get(key) or self.specs[key][1]
             text = f'【{name}】\n{PARAM_HELP[key]}'
         self.hide_help_overlay()
         self.help_lbl.config(text=text)
@@ -1111,6 +1171,14 @@ class LiveDropApp:
         if self.group == '偵測':
             for v, b in self.method_btns.items():
                 c = C_ACCENT if self.params['method'] == v else C_BTN
+                b.config(bg=c, activebackground=c)
+        if self.group == '判定' and self._shown_uni != self.params['uni_algo']:
+            self._show_group('判定')        # 算法改變：換成新算法的參數列
+            self._show_help('uni_algo')
+            return
+        if self.group == '判定':
+            for v, b in self.uni_btns.items():
+                c = C_ACCENT if self.params['uni_algo'] == v else C_BTN
                 b.config(bg=c, activebackground=c)
 
     # ── 參數 / 復原 ──
@@ -1182,6 +1250,8 @@ class LiveDropApp:
         try:
             saved = json.loads(SETTINGS_FILE.read_text())
             params.update({k: v for k, v in saved.get('params', {}).items() if k in params})
+            if params['uni_algo'] not in UNI_NAMES:
+                params['uni_algo'] = 'cover'
             self.rois = [tuple(r) for r in saved.get('rois', [])]
             if saved.get('bayer') in BAYER_CHOICES:
                 self.set_bayer(saved['bayer'])
@@ -1569,6 +1639,10 @@ class LiveDropApp:
         roi_lr = []                     # 各 ROI 左右兩半的覆蓋面積（%）
         lr_px, lr_tot = [0, 0], [0, 0]  # 全部 ROI 合計的左右覆蓋像素與總像素
         radius = max(1, int(round(p['cover_r'] * s)))
+        use_kde = p.get('uni_algo') == 'kde'
+        dens = np.zeros(gray.shape, np.float32) if use_kde else None    # KDE 密度面（縮小座標）
+        kde_h = max(2.0, p['kde_h'] * s)
+        per10k = 1e4 / (s * s)          # 每縮小像素的水滴數 → 每萬原圖像素
         for x1, y1, x2, y2 in rois:
             roi = gray[y1:y2, x1:x2]
             if roi.size == 0:
@@ -1592,9 +1666,18 @@ class LiveDropApp:
             wet_px[y1:y2, x1:x2] |= keep
             in_roi[y1:y2, x1:x2] = True
             roi_pct.append(keep.mean() * 100)
-            m, left, right, tot = coverage(roi.shape, blobs, radius)
-            cover[y1:y2, x1:x2] |= m
-            roi_lr.append((left / max(1, tot[0]) * 100, right / max(1, tot[1]) * 100))
+            if use_kde:
+                D = kde_density(roi.shape, blobs, kde_h)
+                dens[y1:y2, x1:x2] = np.maximum(dens[y1:y2, x1:x2], D)
+                half = roi.shape[1] // 2
+                left, right = float(D[:, :half].sum()), float(D[:, half:].sum())
+                tot = (half * roi.shape[0], (roi.shape[1] - half) * roi.shape[0])
+                unit = per10k           # 左右：平均密度（顆 / 萬原圖像素）
+            else:
+                m, left, right, tot = coverage(roi.shape, blobs, radius)
+                cover[y1:y2, x1:x2] |= m
+                unit = 100              # 左右：覆蓋面積 %
+            roi_lr.append((left / max(1, tot[0]) * unit, right / max(1, tot[1]) * unit))
             lr_px = [lr_px[0] + left, lr_px[1] + right]
             lr_tot = [lr_tot[0] + tot[0], lr_tot[1] + tot[1]]
         n = sum(len(b) for b in all_blobs)
@@ -1603,11 +1686,21 @@ class LiveDropApp:
         area_px = n_px / (s * s)
         area_pct = n_px / max(1, np.count_nonzero(in_roi)) * 100
         # 均勻度：各 ROI 以自己的中線分左右，左半合計 vs 右半合計
-        left_pct, right_pct = (lr_px[i] / max(1, lr_tot[i]) * 100 for i in range(2))
+        unit = per10k if use_kde else 100
+        left_pct, right_pct = (lr_px[i] / max(1, lr_tot[i]) * unit for i in range(2))
         ratio = lr_ratio(left_pct, right_pct)
-        uni = {'cover': sum(lr_px) / max(1, sum(lr_tot)) * 100, 'left': left_pct, 'right': right_pct,
-               'ratio': ratio, 'uneven': ratio is not None and ratio < p['uni_ratio'],
-               'mask': cover, 'roi_lr': roi_lr}
+        limit = p['kde_ratio'] if use_kde else p['uni_ratio']
+        vmax = None
+        if use_kde:
+            # 色階上限：畫面中最密處，至少為單顆水滴峰值的 3 倍，避免只有一兩顆水滴就整片變紅
+            vmax = 3 * float(quartic_kernel(kde_h).max())
+            if in_roi.any():
+                vmax = max(vmax, float(np.percentile(dens[in_roi], 99.5)))
+        uni = {'cover': None if use_kde else sum(lr_px) / max(1, sum(lr_tot)) * 100,
+               'left': left_pct, 'right': right_pct,
+               'ratio': ratio, 'uneven': ratio is not None and ratio < limit,
+               'mask': cover, 'roi_lr': roi_lr, 'algo': 'kde' if use_kde else 'cover',
+               'dens': dens, 'in_roi': in_roi, 'vmax': vmax}
 
         x1, y1, x2, y2 = rois[0]
         roi0 = gray[y1:y2, x1:x2]
@@ -1659,6 +1752,22 @@ class LiveDropApp:
         contours, _ = cv2.findContours(big, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE, offset=(X1, Y1))
         cv2.drawContours(vis, contours, -1, edge, lw)
 
+    @staticmethod
+    def _fill_heat(vis, dens_small, in_roi, s, vmax):
+        """KDE 熱點圖：密度面放大回原圖，ROI 內以 TURBO 色階（藍→紅＝疏→密）半透明疊上。"""
+        bx, by, bw, bh = cv2.boundingRect(in_roi.astype(np.uint8))
+        if not (bw and bh) or not vmax:
+            return
+        H, W = vis.shape[:2]
+        X1, Y1 = int(bx / s), int(by / s)
+        X2, Y2 = min(W, int(np.ceil((bx + bw) / s))), min(H, int(np.ceil((by + bh) / s)))
+        size = (X2 - X1, Y2 - Y1)
+        d = cv2.resize(dens_small[by:by + bh, bx:bx + bw], size, interpolation=cv2.INTER_LINEAR)
+        m = cv2.resize(in_roi[by:by + bh, bx:bx + bw].astype(np.uint8), size, interpolation=cv2.INTER_NEAREST)
+        heat = cv2.applyColorMap(np.clip(d * (255.0 / vmax), 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        sub = vis[Y1:Y2, X1:X2]
+        cv2.copyTo(cv2.addWeighted(sub, 0.4, heat, 0.6, 0), m, sub)
+
     def _overlay(self, vis, det):
         """在畫面上畫 ROI 框、水滴圈（數量模式）、白色像素填色（面積模式）或覆蓋區（均勻模式）與狀態文字
         （原圖與二值化畫面共用）。"""
@@ -1670,7 +1779,10 @@ class LiveDropApp:
             # 面積模式：二值化後算進面積的像素直接塗色（二值化畫面中，被面積篩掉的仍是白色）
             self._fill_mask(vis, wet_px, s, AREA_COLOR, AREA_COLOR, 0.65, max(1, lw // 2))
         elif mode == 'uniform':
-            self._fill_mask(vis, uni['mask'], s, COVER_COLOR, COVER_EDGE, 0.45, lw)
+            if uni.get('algo') == 'kde':
+                self._fill_heat(vis, uni['dens'], uni['in_roi'], s, uni['vmax'])
+            else:
+                self._fill_mask(vis, uni['mask'], s, COVER_COLOR, COVER_EDGE, 0.45, lw)
         for i, ((x1, y1, x2, y2), blobs) in enumerate(zip(rois, all_blobs)):
             c = ROI_COLORS[i % len(ROI_COLORS)]
             X1, Y1, X2, Y2 = int(x1 / s), int(y1 / s), int(x2 / s), int(y2 / s)
@@ -1678,7 +1790,9 @@ class LiveDropApp:
             if mode == 'area':
                 label = f'ROI {i + 1}: {roi_pct[i]:.2f}%'
             elif mode == 'uniform':
-                label = f'ROI {i + 1}: L {uni["roi_lr"][i][0]:.0f}%  R {uni["roi_lr"][i][1]:.0f}%'
+                l, r = uni['roi_lr'][i]
+                label = (f'ROI {i + 1}: L {l:.1f}  R {r:.1f} /10k px' if uni.get('algo') == 'kde'
+                         else f'ROI {i + 1}: L {l:.0f}%  R {r:.0f}%')
             else:
                 label = f'ROI {i + 1}: {len(blobs)}'
             # 均勻模式框內塞滿水滴點，標籤改放框外上方才看得清楚
@@ -1714,7 +1828,10 @@ class LiveDropApp:
         if mode == 'area':
             text += f'  area={area_pct:.2f}% ({area_px:.0f}px)'
         elif mode == 'uniform':
-            text += f'  cover={uni["cover"]:.0f}%  L={uni["left"]:.0f}%  R={uni["right"]:.0f}%'
+            if uni.get('algo') == 'kde':
+                text += f'  KDE  L={uni["left"]:.1f}  R={uni["right"]:.1f} drops/10k px'
+            else:
+                text += f'  cover={uni["cover"]:.0f}%  L={uni["left"]:.0f}%  R={uni["right"]:.0f}%'
         org = (20, vis.shape[0] - 24)
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 0), lw + 4, cv2.LINE_AA)
         cv2.putText(vis, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.4,
@@ -1764,7 +1881,10 @@ class LiveDropApp:
                                   fg=C_TEXT if ratio is None else ('#f87171' if self.uni['uneven'] else '#4ade80'))
             if self.uni:
                 verdict = '無水滴' if ratio is None else ('不均勻' if self.uni['uneven'] else '均勻')
-                uni = f'　左 {self.uni["left"]:.0f}% 右 {self.uni["right"]:.0f}% → {verdict}'
+                if self.uni.get('algo') == 'kde':
+                    uni = f'　KDE 左 {self.uni["left"]:.1f} 右 {self.uni["right"]:.1f} 顆/萬px → {verdict}'
+                else:
+                    uni = f'　左 {self.uni["left"]:.0f}% 右 {self.uni["right"]:.0f}% → {verdict}'
         else:
             self.count_lbl.config(text=str(self.n_drops))
         if self.view_mode != 'uniform':
